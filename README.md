@@ -24,6 +24,14 @@ npm start
 
 打开 `http://127.0.0.1:4782/`。Windows 也可以运行 `start-black-shores-agent.cmd`，macOS/Linux 可以运行 `./start-black-shores-agent.sh`。
 
+Windows 需要静默常驻和登录自启时运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-windows-autostart.ps1
+```
+
+该脚本注册当前用户的 `BLACK_SHORES_AGENT` 计划任务。服务窗口保持隐藏，异常退出后自动重启，运行日志写入本机 `data/service.*.log`。
+
 `npm run setup` 会创建仅保存在本机的 `black-shores.config.json`。该文件、`data/` 账本、日志和环境变量文件都已加入 `.gitignore`。
 
 ## 配置
