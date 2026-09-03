@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="黑海岸 AGENT 系统本地组织工作台"
+    />
+    <title>黑海岸 AGENT 系统</title>
+    <link rel="stylesheet" href="./black-coast.css" />
+  </head>
+  <body>
+    <div class="app-shell" id="appShell">
+      <div class="mobile-backdrop" id="mobileBackdrop"></div>
+
+      <aside class="sidebar" id="sidebar" aria-label="主导航">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <i data-lucide="waves"></i>
+          </div>
+          <div class="brand-copy">
+            <strong>黑海岸 AGENT 系统</strong>
+            <span>本地组织运行台</span>
+          </div>
+        </div>
+
+        <div class="project-identity">
+          <span class="section-label">ACTIVE PROJECT</span>
+          <div class="project-row">
+            <span class="project-signal" aria-hidden="true"></span>
+            <span>
+              <strong id="sidebarProjectName">My Project</strong>
+              <small>单项目主动运行</small>
+            </span>
+          </div>
+        </div>
+
+        <nav class="nav-list" id="navList"></nav>
+
+        <div class="sidebar-footer">
+          <div class="manager-identity">
+            <span class="manager-avatar" aria-hidden="true">总</span>
+            <span>
+              <strong>总管 AGENT</strong>
+              <small id="sidebarManagerAssignment">等待读取配置</small>
+            </span>
+          </div>
+          <div class="runtime-note">
+            <span class="runtime-dot" aria-hidden="true"></span>
+            <span id="sidebarRuntimeNote">本地账本 · 配置读取中</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-shell">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button
+              type="button"
+              class="icon-button mobile-menu-button"
+              id="mobileMenuButton"
+              aria-label="打开导航"
+              title="打开导航"
+            >
+              <i data-lucide="menu" aria-hidden="true"></i>
+            </button>
+            <div>
+              <div class="eyebrow" id="pageEyebrow">组织入口</div>
+              <h1 id="pageTitle">人类工作台</h1>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <span class="system-state" id="systemState">
+              <span class="system-state-dot" aria-hidden="true"></span>
+              正在连接
+            </span>
+            <button type="button" class="icon-button" id="refreshButton" aria-label="刷新" title="刷新">
+              <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            </button>
+          </div>
+        </header>
+
+        <div class="content" id="mainContent" aria-live="polite"></div>
+      </main>
+    </div>
+
+    <dialog class="dialog" id="detailDialog">
+      <div id="detailContent"></div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite">
+      <i data-lucide="check" aria-hidden="true"></i>
+      <span id="toastText"></span>
+    </div>
+
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script src="./black-coast-app.js"></script>
+  </body>
+</html>

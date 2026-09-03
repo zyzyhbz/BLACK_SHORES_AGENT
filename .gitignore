@@ -1,0 +1,9 @@
+black-shores.config.json
+data/
+*.log
+.env
+.env.*
+!.env.example
+node_modules/
+.DS_Store
+Thumbs.db

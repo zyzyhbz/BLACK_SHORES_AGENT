@@ -1,0 +1,69 @@
+{
+  "product": {
+    "name": "黑海岸 AGENT 系统",
+    "locale": "zh-CN"
+  },
+  "project": {
+    "id": "project-default",
+    "name": "My Project",
+    "path": ".",
+    "repository": "local/project",
+    "sourceRef": "origin/main"
+  },
+  "manager": {
+    "adapter": "auto",
+    "model": "",
+    "reasoningEffort": ""
+  },
+  "roles": {},
+  "ledger": {
+    "path": "./data/black-shores-ledger.jsonl"
+  },
+  "testManifest": {
+    "id": "ptm-default",
+    "version": "1.0.0",
+    "requiredTests": []
+  },
+  "adapters": {
+    "codex": {
+      "enabled": true,
+      "command": "",
+      "model": "",
+      "reasoningEffort": ""
+    },
+    "cursor": {
+      "enabled": true,
+      "command": "",
+      "model": "auto",
+      "reasoningEffort": "model-default"
+    },
+    "zcode": {
+      "enabled": true,
+      "node": "",
+      "script": "",
+      "model": "",
+      "reasoningEffort": ""
+    },
+    "grok": {
+      "enabled": true,
+      "command": "",
+      "model": "",
+      "reasoningEffort": "default"
+    },
+    "custom": [
+      {
+        "id": "my-agent",
+        "label": "My AGENT",
+        "enabled": false,
+        "command": "my-agent",
+        "args": ["run", "--model", "{model}", "--reasoning", "{reasoningEffort}", "--cwd", "{cwd}"],
+        "promptMode": "stdin",
+        "outputFormat": "text",
+        "model": "provider/model-name",
+        "models": ["provider/model-name"],
+        "reasoningEffort": "default",
+        "reasoningOptions": ["default"]
+      }
+    ]
+  }
+}
