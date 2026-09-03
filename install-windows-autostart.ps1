@@ -9,7 +9,12 @@ if (-not (Test-Path -LiteralPath $powershellPath)) {
 
 $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcherPath`""
 $action = New-ScheduledTaskAction -Execute $powershellPath -Argument $arguments -WorkingDirectory $PSScriptRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$watchdogTrigger = New-ScheduledTaskTrigger `
+  -Once `
+  -At (Get-Date).AddMinutes(1) `
+  -RepetitionInterval (New-TimeSpan -Minutes 1) `
+  -RepetitionDuration (New-TimeSpan -Days 3650)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 999 `
@@ -22,7 +27,7 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask `
   -TaskName $taskName `
   -Action $action `
-  -Trigger $trigger `
+  -Trigger @($logonTrigger, $watchdogTrigger) `
   -Principal $principal `
   -Settings $settings `
   -Description "Keep BLACK_SHORES_AGENT available on 127.0.0.1 without a visible terminal." `

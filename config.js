@@ -13,6 +13,9 @@ const DEFAULT_CONFIG = {
     repository: "local/project",
     sourceRef: "origin/main",
   },
+  inactiveProjects: [
+    { id: "project-fixture-inactive", name: "Inactive Fixture", status: "inactive" },
+  ],
   manager: {
     adapter: "auto",
     model: "",
@@ -30,7 +33,8 @@ const DEFAULT_CONFIG = {
   channels: {
     email: {
       secretsPath: "./data/email-channel.secrets.json",
-      statePath: "./data/email-channel.state.json"
+      statePath: "./data/email-channel.state.json",
+      devInboxPath: "./data/dev-inbox.jsonl"
     },
   },
   testManifest: {
@@ -113,7 +117,13 @@ function loadConfig(rootDirectory = __dirname) {
     config.channels.email.statePath,
     "./data/email-channel.state.json",
   );
+  config.channels.email.devInboxPath = resolveFrom(
+    baseDirectory,
+    config.channels.email.devInboxPath,
+    "./data/dev-inbox.jsonl",
+  );
   if (!Array.isArray(config.adapters.custom)) config.adapters.custom = [];
+  if (!Array.isArray(config.inactiveProjects)) config.inactiveProjects = [];
   return config;
 }
 

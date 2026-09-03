@@ -679,6 +679,144 @@ test("global tuner context stays independent from a blocked Mission", async () =
   assert.ok(tunerRequests.every((event) => event.missionId === null));
 });
 
+test("safe pause preserves the logical run and resume creates a new physical invocation", async () => {
+  const { directory, ledger } = tempLedger();
+  let invocationCount = 0;
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => {
+      invocationCount += 1;
+      if (invocationCount === 1) {
+        await new Promise((resolve, reject) => {
+          const stop = () => reject(Object.assign(new Error("paused by owner"), { code: "SAFE_PAUSE" }));
+          if (signal.aborted) stop();
+          else signal.addEventListener("abort", stop, { once: true });
+        });
+      }
+      return {
+        output: JSON.stringify({
+          readyForBaseline: false,
+          message: "已从暂停检查点继续需求整理",
+          questions: [],
+        }),
+      };
+    },
+  });
+
+  const mission = service.createMission("验证活动任务能够安全暂停并继续运行");
+  const firstTask = service.activeRuns.get(mission.id).task;
+  const paused = service.executeCommand({
+    content: "安全暂停任务",
+    channel: "tuner-chat",
+    context: "global",
+  });
+  assert.equal(paused.action, "pause_requested");
+  assert.equal(paused.mission.id, mission.id);
+  await firstTask;
+
+  const waiting = service.mission(mission.id);
+  assert.equal(waiting.status, "waiting");
+  assert.equal(waiting.blockers.length, 0);
+  assert.equal(waiting.runs.length, 1);
+  assert.equal(waiting.runs[0].status, "paused");
+  assert.equal(waiting.runs[0].invocations[0].status, "interrupted");
+
+  const resumed = service.resumePaused(mission.id);
+  assert.equal(resumed.runs.length, 1);
+  await settle(service);
+  const completed = service.mission(mission.id);
+  assert.equal(completed.status, "clarifying");
+  assert.equal(completed.runs.length, 1);
+  assert.equal(completed.runs[0].status, "completed");
+  assert.equal(completed.runs[0].invocations.length, 2);
+  assert.equal(completed.runs[0].invocations[1].resumed, true);
+  assert.equal(ledger.events().filter((event) => event.type === "run.pause_requested").length, 1);
+  assert.equal(ledger.events().filter((event) => event.type === "run.paused").length, 1);
+  assert.equal(ledger.events().filter((event) => event.type === "run.resume_requested").length, 1);
+});
+
+test("a paused Mission can return to requirements clarification with a new instruction", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-paused-revision",
+    payload: { title: "暂停中的任务", goal: "实现一个需要中途修改的完整功能", workflowProfile: "light" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-paused-revision",
+    payload: { from: "intake", to: "clarifying", reason: "开始澄清" },
+  });
+  ledger.append("run.started", {
+    missionId: "mission-paused-revision",
+    actorRoleId: "requirements-lead",
+    payload: { runId: "run-paused", roleId: "requirements-lead", roleName: "需求明确岗" },
+  });
+  ledger.append("run.paused", {
+    missionId: "mission-paused-revision",
+    actorRoleId: "requirements-lead",
+    payload: { runId: "run-paused", reason: "人类请求安全暂停" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-paused-revision",
+    payload: { from: "clarifying", to: "waiting", reason: "等待修改" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: JSON.stringify({ readyForBaseline: false, message: "已按新要求重新整理", questions: [] }),
+    }),
+  });
+
+  const revised = service.executeCommand({
+    content: "调整需求：保留现有数据并缩小改动范围",
+    missionId: "mission-paused-revision",
+  });
+  assert.equal(revised.action, "revise_requirements");
+  assert.equal(revised.mission.status, "clarifying");
+  assert.equal(ledger.events().filter((event) => event.type === "requirements_revision.requested").length, 1);
+  await settle(service);
+  assert.match(service.mission("mission-paused-revision").messages.at(-1).content, /新要求/);
+});
+
+test("available actions disable unrelated Mission controls while another Run is active", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-release-waiting",
+    payload: { title: "待验收任务", goal: "验证跨 Mission 控制隔离保持一致", workflowProfile: "heavy" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-release-waiting",
+    payload: { from: "intake", to: "awaiting_result_acceptance", reason: "等待验收" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      const stop = () => reject(Object.assign(new Error("paused"), { code: "SAFE_PAUSE" }));
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
+    }),
+  });
+  const activeMission = service.createMission("启动另一个持续运行的任务用于验证控制隔离");
+  const activeTask = service.activeRuns.get(activeMission.id).task;
+
+  const state = service.state();
+  assert.equal(state.controls.canCreateMission, false);
+  assert.deepEqual(
+    state.missions.find((mission) => mission.id === "mission-release-waiting").availableActions,
+    ["query-status"],
+  );
+  assert.ok(state.missions.find((mission) => mission.id === activeMission.id).availableActions.includes("pause"));
+  assert.throws(
+    () => service.acceptResult("mission-release-waiting"),
+    /另一个 Mission 正在执行/,
+  );
+
+  service.requestSafePause(activeMission.id);
+  await activeTask;
+});
+
 test("auto workflow profile explains deterministic light and heavy selections", async () => {
   const first = tempLedger();
   const lightService = new OrganizationService({ ledger: first.ledger, project: project(first.directory), runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }) });
@@ -693,4 +831,471 @@ test("auto workflow profile explains deterministic light and heavy selections", 
   assert.equal(heavy.workflowProfile.resolved, "heavy");
   assert.match(heavy.workflowProfile.reason, /部署|生产/);
   await settle(heavyService);
+});
+
+test("human gates automatically open a decision request with object version", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: JSON.stringify({
+        readyForBaseline: true,
+        message: "基线草案已形成。",
+        questions: [],
+        baseline: {
+          outcome: "进入工作页面",
+          inScope: ["登录后导航"],
+          outOfScope: [],
+          acceptanceCriteria: ["用户可进入"],
+          testRequirements: ["端到端验证"],
+          constraints: [],
+          knownFacts: [],
+          openRisks: [],
+        },
+      }),
+    }),
+  });
+  const mission = service.createMission("登录完成后页面无法加载，请组织处理");
+  await settle(service);
+  const updated = service.mission(mission.id);
+  assert.equal(updated.status, "awaiting_baseline_confirmation");
+  assert.equal(updated.decisions.length, 1);
+  assert.equal(updated.decisions[0].status, "open");
+  assert.equal(updated.decisions[0].kind, "baseline_confirmation");
+  assert.match(updated.decisions[0].objectVersion, /-v1$/);
+  assert.ok(updated.availableActions.includes("decide"));
+});
+
+test("only the human owner can resolve a decision, and it closes exactly once", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("整理一份面向人类的发布说明文档");
+  await settle(service);
+  const created = service.requestDecision(mission.id, {
+    title: "是否扩大本次发布范围",
+    kind: "scope",
+    options: ["保持范围", "扩大范围"],
+    urgency: "high",
+  });
+  const decisionId = created.decisions.at(-1).id;
+  assert.throws(() => service.resolveDecision(mission.id, decisionId, { resolution: "approved", decidedBy: "chief-manager" }), /只有人类负责人/);
+  assert.throws(() => service.resolveDecision(mission.id, decisionId, { resolution: "maybe", decidedBy: "human-owner" }), /批准、驳回或暂缓/);
+  const resolved = service.resolveDecision(mission.id, decisionId, { resolution: "approved", decidedBy: "human-owner", note: "同意保持范围" });
+  assert.equal(resolved.decisions.find((item) => item.id === decisionId).status, "approved");
+  assert.throws(() => service.resolveDecision(mission.id, decisionId, { resolution: "rejected", decidedBy: "human-owner" }), /不存在或已处理/);
+});
+
+test("emergency override requires explicit gates and opens a linked risk debt", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("修复一个导致发布阻塞的线上缺陷");
+  await settle(service);
+  assert.throws(() => service.grantOverride(mission.id, {
+    decidedBy: "chief-manager", overriddenGates: ["test"], reason: "着急", risk: "有风险", expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  }), /只有人类负责人/);
+  assert.throws(() => service.grantOverride(mission.id, {
+    decidedBy: "human-owner", overriddenGates: [], reason: "着急发布", risk: "可能回归", expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  }), /明确列出/);
+  const updated = service.grantOverride(mission.id, {
+    decidedBy: "human-owner",
+    overriddenGates: ["模拟器全量测试"],
+    reason: "线上事故止血",
+    risk: "可能漏过回归缺陷",
+    allowedActions: ["approve-deployment"],
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  });
+  assert.equal(updated.overrides.length, 1);
+  assert.equal(updated.overrides[0].status, "active");
+  assert.equal(updated.riskDebts.length, 1);
+  assert.equal(updated.riskDebts[0].status, "open");
+  assert.equal(updated.riskDebts[0].linkedOverrideId, updated.overrides[0].id);
+  const expired = service.expireOverride(mission.id, updated.overrides[0].id);
+  assert.equal(expired.overrides[0].status, "expired");
+  const closed = service.closeRiskDebt(mission.id, updated.riskDebts[0].id, { resolution: "已补测并复盘" });
+  assert.equal(closed.riskDebts[0].status, "closed");
+});
+
+test("cancel ends a waiting mission and emergency stop blocks an active run", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      const stop = () => reject(Object.assign(new Error("stopped by owner"), { code: "STOP" }));
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
+    }),
+  });
+  const mission = service.createMission("验证取消与紧急停止语义互相区分");
+  const firstTask = service.activeRuns.get(mission.id).task;
+  const stopped = service.emergencyStop(mission.id, { reason: "测试紧急停止" });
+  assert.ok(stopped);
+  await firstTask;
+  const blocked = service.mission(mission.id);
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.runs[0].status, "stopped");
+  assert.equal(blocked.blockers.at(-1).category, "emergency_stop");
+  const cancelled = service.cancelMission(mission.id, { reason: "测试取消" });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.cancellations.length, 1);
+  assert.throws(() => service.cancelMission(mission.id, {}), /已终结/);
+});
+
+test("stale-generation outputs are traced but never advance the new baseline", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: JSON.stringify({
+        readyForBaseline: true,
+        message: "旧世代基线",
+        questions: [],
+        baseline: {
+          outcome: "旧目标", inScope: ["旧范围"], outOfScope: [],
+          acceptanceCriteria: ["旧标准"], testRequirements: [], constraints: [], knownFacts: [], openRisks: [],
+        },
+      }),
+    }),
+  });
+  const mission = service.createMission("验证旧世代迟到输出隔离");
+  assert.equal(service.mission(mission.id).revision, 1);
+  ledger.append("mission.revision_incremented", {
+    missionId: mission.id,
+    actorRoleId: "human-owner",
+    payload: { revision: 2, reason: "测试递增世代" },
+  });
+  await settle(service);
+  const updated = service.mission(mission.id);
+  assert.equal(updated.revision, 2);
+  assert.equal(updated.runs[0].status, "superseded");
+  assert.equal(updated.baseline, null);
+  assert.ok(ledger.events().some((event) => event.type === "run.output_rejected"));
+});
+
+test("decision cases separate divergence, deliberation and the owner decision", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("验证发散审议决定分离");
+  await settle(service);
+  assert.throws(() => service.openDecisionCase(mission.id, { title: "选择缓存方案" }), /DecisionOwner/);
+  const opened = service.openDecisionCase(mission.id, { title: "选择缓存方案", context: "读多写少", ownerRoleId: "human-owner" });
+  const caseId = opened.decisionCases.at(-1).id;
+  assert.throws(() => service.recordIdeaSet(mission.id, { decisionCaseId: caseId, clusters: [] }), /实质不同/);
+  service.recordIdeaSet(mission.id, { decisionCaseId: caseId, problem: "缓存", clusters: ["本地缓存", "集中式缓存"], extremeOptions: ["无缓存"] });
+  assert.throws(() => service.recordDecisionBrief(mission.id, { decisionCaseId: caseId, candidates: ["本地缓存"] }), /少数意见/);
+  service.recordDecisionBrief(mission.id, {
+    decisionCaseId: caseId,
+    candidates: ["本地缓存", "集中式缓存"],
+    recommendation: "本地缓存",
+    minorityOpinions: ["集中式更易观测"],
+  });
+  assert.throws(() => service.decideCase(mission.id, caseId, { decision: "采用本地缓存", decidedBy: "chief-manager" }), /决定权属于/);
+  const decided = service.decideCase(mission.id, caseId, { decision: "采用本地缓存", decidedBy: "human-owner" });
+  assert.equal(decided.decisionCases.find((item) => item.id === caseId).status, "decided");
+});
+
+test("role dispatch respects operating modes and blocker activation", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-modes",
+    payload: { title: "模式门控任务", goal: "验证运行模式门控", workflowProfile: "light" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-modes",
+    payload: { from: "intake", to: "clarifying", reason: "开始澄清" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      const stop = () => reject(Object.assign(new Error("paused"), { code: "SAFE_PAUSE" }));
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
+    }),
+  });
+  assert.throws(() => service._queueRoleRun("mission-modes", "evolution-lead", () => "", () => {}), /shadow 模式/);
+  assert.throws(() => service._queueRoleRun("mission-modes", "creator", () => "", () => {}), /条件认知角色/);
+  assert.throws(() => service._queueRoleRun("mission-modes", "blocker-lead", () => "", () => {}), /BlockerCase/);
+  assert.throws(() => service._queueRoleRun("mission-modes", "ghost-role", () => "", () => {}), /未知角色/);
+  service.openDecisionCase("mission-modes", { title: "开放问题", ownerRoleId: "human-owner" });
+  service._queueRoleRun("mission-modes", "creator", () => "提示", () => {});
+  assert.ok(service.activeRuns.has("mission-modes"));
+  service.requestSafePause("mission-modes");
+  await service.activeRuns.get("mission-modes").task;
+});
+
+test("evolution proposals and skills stay advisory until humans decide", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("验证演进与技能生命周期");
+  await settle(service);
+  assert.throws(() => service.submitEvolutionProposal(mission.id, { problem: "太短", hypothesis: "x" }), /可证伪假设/);
+  const proposed = service.submitEvolutionProposal(mission.id, {
+    problem: "复核经常漏掉鉴权变更",
+    evidence: "近三次复核记录",
+    hypothesis: "鉴权检查表可复用",
+    rollback: "删除检查表文件",
+  });
+  const proposalId = proposed.evolutionProposals.at(-1).id;
+  assert.throws(() => service.decideEvolutionProposal(mission.id, proposalId, { decision: "approved", decidedBy: "evolution-lead" }), /人类负责人/);
+  const decided = service.decideEvolutionProposal(mission.id, proposalId, { decision: "approved", decidedBy: "human-owner" });
+  assert.equal(decided.evolutionProposals.at(-1).status, "approved");
+  const skilled = service.recordSkillCandidate(mission.id, { name: "鉴权复核表", source: "复核记录" });
+  const skillId = skilled.skills.at(-1).id;
+  assert.throws(() => service.decideSkill(mission.id, skillId, { decision: "published", decidedBy: "engineering" }), /信息与技能管理岗/);
+  const published = service.decideSkill(mission.id, skillId, { decision: "published", decidedBy: "human-owner", version: "1.1.0" });
+  assert.equal(published.skills.at(-1).status, "published");
+});
+
+test("assignment changes take snapshots that later runs carry", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const updated = service.setAssignments({
+    managerAssignment: { adapterId: "codex", model: "m", reasoningEffort: "high", ready: true },
+    roleAssignments: {},
+  });
+  assert.equal(updated.assignmentSnapshots.length, 1);
+  const mission = service.createMission("验证任职快照跟随");
+  await settle(service);
+  const run = service.mission(mission.id).runs[0];
+  assert.equal(run.assignmentSnapshotId, updated.assignmentSnapshots[0].id);
+});
+
+test("due light deliveries can be started in bulk for heavy review", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-light-done",
+    payload: { title: "轻度完成任务", goal: "验证自动重度回顾评估", workflowProfile: "light" },
+  });
+  for (const status of ["clarifying", "awaiting_baseline_confirmation", "planning", "executing", "awaiting_review"]) {
+    ledger.append("mission.status_changed", { missionId: "mission-light-done", payload: { from: "intake", to: status, reason: "推进" } });
+  }
+  ledger.append("mission.status_changed", { missionId: "mission-light-done", payload: { from: "awaiting_review", to: "light_completed", reason: "轻度交付" } });
+  for (let index = 0; index < 5; index += 1) {
+    ledger.append("change_record.recorded", { missionId: "mission-light-done", payload: { id: `change-${index}`, summary: `变更 ${index}` } });
+  }
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ message: "测试", verdict: "pass", candidate: { commit: "abc", clean: true }, runs: [], externalEvidencePackage: { buildIdentity: "x", preconditions: [], steps: [], uncoveredRisks: [] } }) }),
+  });
+  const evaluation = service.evaluateAutoReview("mission-light-done");
+  assert.equal(evaluation.triggered, true);
+  assert.match(evaluation.reasons.join(""), /阈值/);
+  const result = service.autoStartDueReviews();
+  assert.deepEqual(result.started, ["mission-light-done"]);
+});
+
+test("roles receive versioned contracts plus dedicated retrieval views", async () => {
+  const { retrievalFocusFor, ideaClusterSimilarity } = require("./organization-core");
+  assert.ok(retrievalFocusFor("tester").includes("manifest"));
+  assert.ok(retrievalFocusFor("unknown-role").includes("goal"));
+  assert.equal(ideaClusterSimilarity("本地缓存方案", "本地缓存方案"), 1);
+  assert.ok(ideaClusterSimilarity("本地缓存方案", "集中式远端缓存集群") < 0.8);
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("验证角色检索视图");
+  await settle(service);
+  const opened = service.openDecisionCase(mission.id, { title: "视图验证事项", ownerRoleId: "human-owner" });
+  const caseId = opened.decisionCases.at(-1).id;
+  assert.throws(() => service.recordIdeaSet(mission.id, {
+    decisionCaseId: caseId,
+    clusters: ["本地缓存方案", "本地缓存方案"],
+  }), /同义/);
+  assert.throws(() => service.decideCase(mission.id, caseId, { decision: "直接决定", decidedBy: "human-owner" }), /DecisionBrief/);
+});
+
+test("override never rewrites failure and every entity carries a project id", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => { throw new Error("model unavailable"); },
+  });
+  const mission = service.createMission("验证绕过不改写失败");
+  await settle(service);
+  assert.equal(service.mission(mission.id).status, "blocked");
+  const updated = service.grantOverride(mission.id, {
+    decidedBy: "human-owner",
+    overriddenGates: ["自动化回归"],
+    reason: "线上事故止血",
+    risk: "可能漏过回归缺陷",
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  });
+  assert.equal(updated.status, "blocked");
+  assert.ok(updated.blockers.some((item) => item.status === "open"));
+  assert.equal(updated.riskDebts.length, 1);
+  const state = service.state();
+  assert.ok(state.missions.every((item) => typeof item.projectId === "string" && item.projectId.length > 0));
+  const direct = service.requestDecision(mission.id, { title: "直报验证", directReport: true });
+  assert.equal(direct.decisions.at(-1).directReport, true);
+});
+
+test("command bus stops, cancels and guards assignment switches", async () => {  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      if (signal.aborted) reject(Object.assign(new Error("stopped"), { code: "STOP" }));
+      else signal.addEventListener("abort", () => reject(Object.assign(new Error("stopped"), { code: "STOP" })), { once: true });
+    }),
+  });
+  const mission = service.createMission("验证命令总线急停与取消");
+  assert.throws(() => service.setAssignments({
+    managerAssignment: { adapterId: "codex", model: "m", reasoningEffort: "high", ready: true },
+    roleAssignments: {},
+  }), /安全暂停/);
+  const stopped = service.executeCommand({ content: "紧急停止", missionId: mission.id });
+  assert.equal(stopped.action, "emergency_stopped");
+  await service.activeRuns.get(mission.id).task;
+  assert.equal(service.mission(mission.id).status, "blocked");
+  const cancelled = service.executeCommand({ content: "确认取消任务", missionId: mission.id });
+  assert.equal(cancelled.action, "mission_cancelled");
+  assert.equal(service.mission(mission.id).status, "cancelled");
+});
+
+test("published project manifests drive heavy runs and device packages", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ role }) => {
+      if (role.id === "requirements-lead") {
+        return { output: JSON.stringify({ readyForBaseline: true, message: "基线", questions: [], baseline: { outcome: "修复", inScope: ["功能"], outOfScope: [], acceptanceCriteria: ["通过"], testRequirements: ["回归"], constraints: [], knownFacts: [], openRisks: [] } }) };
+      }
+      if (role.id === "chief-manager") {
+        return { output: JSON.stringify({ message: "计划", charter: { outcome: "修复", scope: ["功能"], constraints: [], successEvidence: [], escalationConditions: [] }, workItems: [
+          { title: "实现", ownerRoleId: "engineering", deliverable: "commit", acceptance: [] },
+          { title: "复核", ownerRoleId: "independent-reviewer", deliverable: "review", acceptance: [] },
+          { title: "测试", ownerRoleId: "tester", deliverable: "tests", acceptance: [] },
+        ] }) };
+      }
+      if (role.id === "engineering") return { output: JSON.stringify({ message: "完成", result: "completed", artifacts: ["c1"], tests: [] }) };
+      if (role.id === "independent-reviewer") return { output: JSON.stringify({ message: "通过", verdict: "pass", findings: [], requirementCoverage: [], residualRisks: [] }) };
+      return { output: JSON.stringify({
+        message: "全量通过",
+        verdict: "pass",
+        candidate: { commit: "abcdef1234567890", clean: true },
+        runs: [
+          { testId: "project-regression", result: "passed", evidence: "ok" },
+          { testId: "mini-smoke", result: "passed", evidence: "ok" },
+        ],
+        externalEvidencePackage: { buildIdentity: "pending", steps: [] },
+      }) };
+    },
+  });
+  const mission = service.createMission("修复发布回归并完成全量验证", "heavy");
+  const manifest = service.publishTestManifest({
+    projectId: service.mission(mission.id).projectId,
+    version: "2026.09-mvp.2",
+    requiredTests: [
+      { id: "project-regression", name: "项目自动化回归", level: "integration", command: "pnpm test", environment: "冻结候选工作树" },
+      { id: "mini-smoke", name: "小程序冒烟", level: "e2e", command: "pnpm run smoke", environment: "模拟器" },
+    ],
+  });
+  assert.throws(() => service.publishTestManifest({ projectId: "x", version: "v2", requiredTests: [] }), /至少需要一个必跑项/);
+  await settle(service);
+  service.confirmBaseline(mission.id);
+  await settle(service);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await settle(service);
+  const ready = service.mission(mission.id);
+  assert.equal(ready.status, "release_candidate_ready");
+  assert.equal(ready.testRuns[0].projectTestManifestId, manifest.id);
+  assert.match(ready.releaseCandidate.version, /2026\.09-mvp\.2-rc/);
+  assert.equal(ready.releaseCandidate.environment, "preview");
+  assert.ok(ready.releaseCandidate.requirementBaselineVersion);
+  const packaged = service.generateDevicePackage(mission.id, {
+    version: "v2.1.12",
+    buildIdentity: "mini-build-abc123",
+    commit: "abcdef1234567890",
+    devices: ["Pixel 7"],
+  });
+  const devicePackage = packaged.externalEvidencePackages.at(-1);
+  assert.equal(devicePackage.steps.length, 2);
+  assert.throws(() => service.recordDeviceEvidence(mission.id, devicePackage.id, {
+    tester: "人类测试人",
+    results: [{ stepId: devicePackage.steps[0].id, result: "passed", evidence: "截图" }],
+  }), /缺少步骤证据/);
+  const evidenced = service.recordDeviceEvidence(mission.id, devicePackage.id, {
+    tester: "人类测试人",
+    results: devicePackage.steps.map((step) => ({ stepId: step.id, result: "passed", evidence: "截图已留存" })),
+  });
+  assert.equal(evidenced.externalEvidencePackages.at(-1).status, "passed");
+  const deprecated = service.deprecateTestManifest(manifest.id, { reason: "新版本接管" });
+  assert.equal(deprecated.deprecated, true);
+});
+
+test("every work item has exactly one responsible role", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ role }) => {
+      if (role.id === "requirements-lead") {
+        return { output: JSON.stringify({ readyForBaseline: true, message: "基线", questions: [], baseline: { outcome: "修复", inScope: ["功能"], outOfScope: [], acceptanceCriteria: ["通过"], testRequirements: ["回归"], constraints: [], knownFacts: [], openRisks: [] } }) };
+      }
+      return { output: JSON.stringify({ message: "计划", charter: { outcome: "修复", scope: ["功能"], constraints: [], successEvidence: [], escalationConditions: [] }, workItems: [
+        { title: "实现", ownerRoleId: "engineering", deliverable: "commit", acceptance: [] },
+        { title: "复核", ownerRoleId: "independent-reviewer", deliverable: "review", acceptance: [] },
+      ] }) };
+    },
+  });
+  const mission = service.createMission("验证工作项唯一负责人");
+  await settle(service);
+  service.confirmBaseline(mission.id);
+  await settle(service);
+  const planned = service.mission(mission.id);
+  assert.ok(planned.workItems.length > 0);
+  for (const item of planned.workItems) {
+    assert.equal(typeof item.ownerRoleId, "string");
+    assert.ok(item.ownerRoleId.length > 0);
+  }
+});
+
+test("recording waiting consumes no model runs", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-wait-quiet",
+    payload: { title: "等待任务", goal: "验证等待不消耗模型", workflowProfile: "light" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-wait-quiet",
+    payload: { from: "intake", to: "clarifying", reason: "开始" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => { throw new Error("must not be dispatched"); },
+  });
+  const updated = service.recordWaiting("mission-wait-quiet", { reason: "等外部排期" });
+  assert.equal(updated.waitingConditions.length, 1);
+  assert.equal(service.activeRuns.size, 0);
+  assert.equal(updated.runs.length, 0);
 });

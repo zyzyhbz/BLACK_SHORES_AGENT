@@ -95,3 +95,35 @@ test("read-only roles are traced without creating mutation backups", async () =>
   assert.equal(governance.status().backup.archiveCount, 0);
   assert.equal(governance.status().actionTrace.roleLogCount, 1);
 });
+
+test("a completed action can be reverted from its pre-action backup with human confirmation", async () => {
+  const { projectDirectory, ledger, governance } = fixture();
+  const action = await governance.begin({
+    roleId: "engineering",
+    roleName: "工程执行岗",
+    missionId: "mission-3",
+    runId: "run-3",
+    invocationId: "invocation-3",
+    adapterId: "codex",
+    model: "code-model",
+    reasoningEffort: "high",
+    goal: "修改 source.txt",
+    scope: ["source.txt"],
+  });
+  fs.writeFileSync(path.join(projectDirectory, "source.txt"), "after\n", "utf8");
+  fs.writeFileSync(path.join(projectDirectory, "scratch-new.txt"), "new\n", "utf8");
+  governance.complete(action, { status: "completed", summary: "修改完成" });
+  assert.equal(fs.readFileSync(path.join(projectDirectory, "source.txt"), "utf8"), "after\n");
+  assert.throws(() => governance.revertAction(action.id, { reason: "改错了", confirmedBy: "engineering" }), /人类负责人另行确认/);
+  const result = governance.revertAction(action.id, {
+    reason: "改错了需要回滚",
+    confirmedBy: "human-owner",
+    paths: ["source.txt", "scratch-new.txt"],
+  });
+  assert.deepEqual(result.restored, ["source.txt"]);
+  assert.deepEqual(result.deleted, ["scratch-new.txt"]);
+  assert.equal(fs.readFileSync(path.join(projectDirectory, "source.txt"), "utf8"), "before\n");
+  assert.equal(fs.existsSync(path.join(projectDirectory, "scratch-new.txt")), false);
+  assert.throws(() => governance.revertAction(action.id, { reason: "再撤一次", confirmedBy: "human-owner", paths: ["source.txt"] }), /已经撤销过/);
+  assert.ok(ledger.events().some((event) => event.type === "action.reverted"));
+});

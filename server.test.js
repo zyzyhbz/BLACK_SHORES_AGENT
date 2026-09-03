@@ -253,6 +253,145 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   assert.equal(directRecord.actionResult.status, "completed");
 });
 
+test("an active organization Run can be safely paused through HTTP", async (context) => {
+  const directory = tempDirectory();
+  const ledgerPath = path.join(directory, "ledger.jsonl");
+  const mockAgent = path.join(directory, "waiting-agent.js");
+  fs.writeFileSync(
+    mockAgent,
+    "process.stdin.resume(); setInterval(() => {}, 1000);\n",
+    "utf8",
+  );
+  const server = await startServer({
+    ledgerPath,
+    worktree: directory,
+    manager: { adapter: "waiting-agent", model: "local/wait", reasoningEffort: "high" },
+    adapters: {
+      codex: { enabled: false },
+      cursor: { enabled: false },
+      zcode: { enabled: false },
+      grok: { enabled: false },
+      custom: [{
+        id: "waiting-agent",
+        label: "Waiting AGENT",
+        enabled: true,
+        command: process.execPath,
+        args: [mockAgent],
+        promptMode: "stdin",
+        outputFormat: "text",
+        model: "local/wait",
+        models: ["local/wait"],
+        reasoningEffort: "high",
+        reasoningOptions: ["high"],
+      }],
+    },
+  });
+  context.after(() => stopServer(server.child));
+
+  const createdResponse = await fetch(`${server.origin}/api/organization/missions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ goal: "验证服务能够保存现场并安全暂停活动任务", workflowProfile: "light" }),
+  });
+  assert.equal(createdResponse.status, 202);
+  const missionId = (await createdResponse.json()).mission.id;
+
+  let state;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    state = await (await fetch(`${server.origin}/api/organization/state`)).json();
+    if (state.activeRuns.some((run) => run.missionId === missionId)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(state.activeRuns.some((run) => run.missionId === missionId), true);
+
+  const pauseResponse = await fetch(`${server.origin}/api/organization/missions/${encodeURIComponent(missionId)}/pause`, {
+    method: "POST",
+  });
+  assert.equal(pauseResponse.status, 202);
+  assert.equal((await pauseResponse.json()).pauseRequested, true);
+
+  let mission;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    state = await (await fetch(`${server.origin}/api/organization/state`)).json();
+    mission = state.missions.find((item) => item.id === missionId);
+    if (mission?.status === "waiting" && state.activeRuns.length === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(mission.status, "waiting");
+  assert.equal(mission.runs[0].status, "paused");
+  assert.equal(mission.runs[0].invocations[0].status, "interrupted");
+  assert.equal(mission.blockers.length, 0);
+});
+
+test("the workbench exposes every human-facing Mission control", () => {
+  const source = fs.readFileSync(path.join(__dirname, "black-coast-app.js"), "utf8");
+  const controls = [
+    'data-action="pause"',
+    'data-action="resume"',
+    'data-action="retry"',
+    'data-action="request-revision"',
+    'data-action="start-heavy-review"',
+    'data-action="confirm-baseline"',
+    'data-action="verify-source"',
+    'data-action="approve-merge"',
+    'data-action="approve-deployment"',
+    'data-action="accept-result"',
+    'data-action="emergency-stop"',
+    'data-action="cancel"',
+    'data-action="resolve-decision"',
+    'data-action="close-waiting"',
+    'data-action="decide-evolution"',
+    'data-action="decide-skill"',
+    'data-action="revert-action"',
+    'data-action="new-decision"',
+    'data-action="new-override"',
+    'data-action="new-waiting"',
+    'data-action="new-manifest"',
+    'data-action="new-case"',
+    'data-action="new-idea"',
+    'data-action="new-brief"',
+    'data-action="decide-case"',
+    'data-action="new-evolution"',
+    'data-action="new-skill"',
+    'data-action="device-package"',
+    'data-action="device-evidence"',
+    'data-action="quality-decision"',
+    "data-workflow-profile",
+    "externalEvidenceForm",
+  ];
+  controls.forEach((control) => assert.ok(source.includes(control), `前端缺少人工动作入口：${control}`));
+  assert.match(source, /missionActionAvailable\(mission, "pause"\)/);
+  assert.match(source, /organizationState\?\.controls\?\.canCreateMission/);
+  assert.match(source, /commandDrafts/);
+  assert.match(source, /commandSelections/);
+});
+
+test("projects and inspections expose isolation and patrol state", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({ ledgerPath: path.join(directory, "ledger.jsonl"), worktree: directory });
+  context.after(() => stopServer(server.child));
+  const projects = await (await fetch(`${server.origin}/api/projects`)).json();
+  assert.equal(projects.active.status, "active");
+  assert.ok(projects.inactive.some((item) => item.status === "inactive"));
+  const state = await (await fetch(`${server.origin}/api/organization/state`)).json();
+  assert.ok(state.missions.every((mission) => !projects.inactive.some((item) => item.id === mission.projectId)));
+  const inspections = await (await fetch(`${server.origin}/api/organization/inspections`)).json();
+  assert.ok(Array.isArray(inspections.findings));
+});
+
+test("the Windows command launcher never owns the long-running Node process", () => {
+  const commandLauncher = fs.readFileSync(path.join(__dirname, "start-black-shores-agent.cmd"), "utf8");
+  const backgroundLauncher = fs.readFileSync(path.join(__dirname, "launch-black-shores-agent.ps1"), "utf8");
+  const installer = fs.readFileSync(path.join(__dirname, "install-windows-autostart.ps1"), "utf8");
+  assert.doesNotMatch(commandLauncher, /\bnode(?:\.exe)?\s+server\.js\b/i);
+  assert.match(commandLauncher, /launch-black-shores-agent\.ps1/i);
+  assert.match(backgroundLauncher, /Start-ScheduledTask/);
+  assert.match(backgroundLauncher, /Start-Process/);
+  assert.match(backgroundLauncher, /WindowStyle Hidden/);
+  assert.match(installer, /watchdogTrigger/);
+  assert.match(installer, /RepetitionInterval/);
+});
+
 test("configuration API persists manager and per-role assignments and registers a new AGENT", async (context) => {
   const directory = tempDirectory();
   const server = await startServer({
@@ -344,4 +483,75 @@ test("configuration API persists manager and per-role assignments and registers 
   assert.equal(health.agents["second-vendor"].connected, true);
   const updatedConfig = JSON.parse(fs.readFileSync(server.configPath, "utf8"));
   assert.ok(updatedConfig.adapters.custom.some((adapter) => adapter.id === "second-vendor"));
+});
+
+test("adapter probe detects executables and manifests manage versions over HTTP", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({ ledgerPath: path.join(directory, "ledger.jsonl"), worktree: directory });
+  context.after(() => stopServer(server.child));
+
+  const probeResponse = await fetch(`${server.origin}/api/configuration/adapters/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: process.execPath }),
+  });
+  assert.equal(probeResponse.status, 200);
+  const probe = await probeResponse.json();
+  assert.equal(probe.detected, true);
+  assert.match(probe.version, /^v\d+/);
+
+  const missingProbe = await fetch(`${server.origin}/api/configuration/adapters/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: "definitely-not-a-real-command-xyz" }),
+  });
+  assert.equal(missingProbe.status, 200);
+  assert.equal((await missingProbe.json()).detected, false);
+
+  const publishResponse = await fetch(`${server.origin}/api/test-manifests`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId: "project-server-test", version: "9.9.9", requiredTests: [{ id: "t1", name: "冒烟", command: "run" }] }),
+  });
+  assert.equal(publishResponse.status, 201);
+  const list = await (await fetch(`${server.origin}/api/test-manifests`)).json();
+  assert.equal(list.manifests.length, 1);
+  assert.equal(list.manifests[0].version, "9.9.9");
+});
+
+test("decision inbox API creates and resolves Mission decisions", async (context) => {
+  const directory = tempDirectory();
+  const ledgerPath = path.join(directory, "ledger.jsonl");
+  const ledger = new JsonlLedger(ledgerPath);
+  ledger.append("mission.created", {
+    missionId: "mission-decision-http",
+    payload: { title: "决策收件箱任务", goal: "验证决策 HTTP 接口的完整闭环" },
+  });
+  const server = await startServer({ ledgerPath, worktree: directory });
+  context.after(() => stopServer(server.child));
+
+  const createResponse = await fetch(`${server.origin}/api/organization/missions/mission-decision-http/decisions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "是否继续", options: ["继续", "暂停"], urgency: "high" }),
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  const decisionId = created.mission.decisions.at(-1).id;
+  assert.ok(created.mission.availableActions.includes("decide"));
+
+  const forbidden = await fetch(`${server.origin}/api/organization/missions/mission-decision-http/decisions/${decisionId}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ resolution: "approved", decidedBy: "chief-manager" }),
+  });
+  assert.equal(forbidden.status, 403);
+
+  const resolveResponse = await fetch(`${server.origin}/api/organization/missions/mission-decision-http/decisions/${decisionId}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ resolution: "approved", decidedBy: "human-owner" }),
+  });
+  assert.equal(resolveResponse.status, 200);
+  assert.equal((await resolveResponse.json()).mission.decisions.at(-1).status, "approved");
 });

@@ -712,12 +712,47 @@ function configurationForDisk() {
 
 function persistConfiguration() {
   fs.mkdirSync(path.dirname(appConfig.configPath), { recursive: true });
+  if (fs.existsSync(appConfig.configPath)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = `${appConfig.configPath}.backup-${stamp}.json`;
+    fs.copyFileSync(appConfig.configPath, backupPath);
+    persistConfiguration.lastBackupPath = backupPath;
+    const backups = fs.readdirSync(path.dirname(appConfig.configPath))
+      .filter((name) => name.startsWith(`${path.basename(appConfig.configPath)}.backup-`))
+      .sort();
+    for (const name of backups.slice(0, Math.max(0, backups.length - 5))) {
+      fs.rmSync(path.join(path.dirname(appConfig.configPath), name), { force: true });
+    }
+  }
   fs.writeFileSync(
     appConfig.configPath,
     `${JSON.stringify(configurationForDisk(), null, 2)}\n`,
     "utf8",
   );
   appConfig.configured = true;
+}
+
+function probeAdapterCommand(command, args = []) {
+  const executable = String(command || "").trim();
+  if (!executable) throw Object.assign(new Error("必须填写可执行命令"), { statusCode: 400 });
+  const probeArgs = Array.isArray(args) && args.length ? args.map((item) => String(item)) : ["--version"];
+  if (probeArgs.length > 8 || probeArgs.some((item) => item.length > 500)) {
+    throw Object.assign(new Error("探测参数超出限制"), { statusCode: 400 });
+  }
+  const startedAt = Date.now();
+  const result = spawnSync(executable, probeArgs, {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 20_000,
+  });
+  const output = String(result.stdout || result.stderr || "").trim().slice(0, 2000);
+  return {
+    detected: result.status === 0,
+    version: result.status === 0 ? output.split(/\r?\n/)[0] : "",
+    output,
+    exitCode: result.status,
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 function normalizeAssignmentInput(input, fallback = null) {
@@ -816,7 +851,20 @@ function addCustomAdapter(input) {
   adapters[adapter.id] = adapter;
   appConfig.adapters.custom.push(definition);
   persistConfiguration();
-  return publicAdapter(adapter);
+  return { ...publicAdapter(adapter), rollbackPath: persistConfiguration.lastBackupPath || null };
+}
+
+function rollbackConfiguration(input) {
+  const rollbackPath = String(input?.rollbackPath || "").trim();
+  if (!rollbackPath) throw Object.assign(new Error("必须指定回滚点文件"), { statusCode: 400 });
+  const resolved = path.resolve(rollbackPath);
+  if (path.dirname(resolved) !== path.dirname(path.resolve(appConfig.configPath))) {
+    throw Object.assign(new Error("回滚点必须位于配置目录内"), { statusCode: 400 });
+  }
+  if (!fs.existsSync(resolved)) throw Object.assign(new Error("回滚点文件不存在"), { statusCode: 404 });
+  JSON.parse(fs.readFileSync(resolved, "utf8"));
+  fs.copyFileSync(resolved, appConfig.configPath);
+  return { restored: true, rollbackPath: resolved, configPath: appConfig.configPath };
 }
 
 function publicAdapter(adapter) {
@@ -1318,8 +1366,10 @@ async function handleAgentRun(request, response, adapter) {
 
 function runAdapterBuffered(
   adapter,
-  { prompt, cwd, model, reasoningEffort, onActivity },
+  { prompt, cwd, model, reasoningEffort, onActivity, signal },
 ) {
+  const pauseError = () => Object.assign(new Error("人类请求安全暂停"), { code: "SAFE_PAUSE" });
+  if (signal?.aborted) return Promise.reject(pauseError());
   if (!adapter.connected) return Promise.reject(new Error(adapter.message));
   const workingDirectory = path.resolve(cwd);
   try {
@@ -1366,14 +1416,26 @@ function runAdapterBuffered(
     let stdoutBuffer = "";
     let stderrBuffer = "";
     let settled = false;
+    let interruption = null;
 
     function finish(error, value) {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", handleAbort);
       activeExclusiveRuns.delete(adapter.id);
       if (error) reject(error);
       else resolve(value);
     }
+
+    function handleAbort() {
+      if (settled || interruption) return;
+      interruption = pauseError();
+      onActivity?.({ type: "hub.progress", message: "正在终止物理调用并保存暂停现场" });
+      stopProcessTree(child);
+    }
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    if (signal?.aborted) handleAbort();
 
     function processLine(line) {
       const cleanLine = stripAnsi(line).trim();
@@ -1413,8 +1475,12 @@ function runAdapterBuffered(
     child.stderr.on("data", (chunk) => {
       stderrBuffer = `${stderrBuffer}${stripAnsi(chunk)}`.slice(-20_000);
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) => finish(interruption || error));
     child.on("close", (code, signal) => {
+      if (interruption) {
+        finish(interruption);
+        return;
+      }
       if (adapter.outputFormat !== "text" && stdoutBuffer.trim()) processLine(stdoutBuffer);
       const output = (adapter.outputFormat === "text" ? stdoutBuffer : resultParts.join("")).trim();
       if (code !== 0 || !output) {
@@ -1438,8 +1504,10 @@ function runAdapterBuffered(
       });
     });
 
-    if (adapter.promptViaStdin) child.stdin.end(prompt, "utf8");
-    else child.stdin.end();
+    if (!interruption) {
+      if (adapter.promptViaStdin) child.stdin.end(prompt, "utf8");
+      else child.stdin.end();
+    }
   });
 }
 
@@ -1480,6 +1548,7 @@ const organization = new OrganizationService({
     runId,
     invocationId,
     onActivity,
+    signal,
   }) => {
     const adapter = adapters[adapterId];
     if (!adapter) throw new Error(`未知 AGENT 适配器：${adapterId}`);
@@ -1503,10 +1572,11 @@ const organization = new OrganizationService({
         model,
         reasoningEffort,
         onActivity,
+        signal,
       });
     } catch (error) {
       runtimeGovernance.complete(action, {
-        status: "failed",
+        status: error.code === "SAFE_PAUSE" ? "interrupted" : "failed",
         error: error.message || String(error),
       });
       throw error;
@@ -1525,6 +1595,7 @@ const organization = new OrganizationService({
 const emailBridge = new EmailBridge({
   secretsPath: appConfig.channels.email.secretsPath,
   statePath: appConfig.channels.email.statePath,
+  devInboxPath: appConfig.channels.email.devInboxPath,
   organization,
   ledger: organizationLedger,
 });
@@ -1706,6 +1777,16 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/channels/email/notify") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, await emailBridge.notifyOwner(payload.subject, payload.text));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
   if (request.method === "PUT" && url.pathname === "/api/configuration/assignments") {
     try {
       const payload = await readJsonBody(request);
@@ -1726,6 +1807,26 @@ const server = http.createServer(async (request, response) => {
     try {
       const payload = await readJsonBody(request);
       sendJson(response, 201, { agent: addCustomAdapter(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/configuration/adapters/probe") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, probeAdapterCommand(payload.command, payload.args));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/configuration/rollback") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, rollbackConfiguration(payload));
     } catch (error) {
       organizationError(response, error);
     }
@@ -1765,8 +1866,250 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  const caseCreateMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/cases$/);
+  if (request.method === "POST" && caseCreateMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { mission: organization.openDecisionCase(decodeURIComponent(caseCreateMatch[1]), payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const caseChildMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/cases\/([^/]+)\/(idea-sets|briefs|decide)$/);
+  if (request.method === "POST" && caseChildMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      const missionId = decodeURIComponent(caseChildMatch[1]);
+      const caseId = decodeURIComponent(caseChildMatch[2]);
+      const kind = caseChildMatch[3];
+      if (kind === "idea-sets") sendJson(response, 201, { mission: organization.recordIdeaSet(missionId, { ...payload, decisionCaseId: payload.decisionCaseId || caseId }) });
+      else if (kind === "briefs") sendJson(response, 201, { mission: organization.recordDecisionBrief(missionId, { ...payload, decisionCaseId: caseId }) });
+      else sendJson(response, 200, { mission: organization.decideCase(missionId, caseId, payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const evolutionCreateMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/evolutions$/);
+  if (request.method === "POST" && evolutionCreateMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { mission: organization.submitEvolutionProposal(decodeURIComponent(evolutionCreateMatch[1]), payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const evolutionDecideMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/evolutions\/([^/]+)\/decide$/);
+  if (request.method === "POST" && evolutionDecideMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.decideEvolutionProposal(
+          decodeURIComponent(evolutionDecideMatch[1]),
+          decodeURIComponent(evolutionDecideMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const skillCreateMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/skills$/);
+  if (request.method === "POST" && skillCreateMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { mission: organization.recordSkillCandidate(decodeURIComponent(skillCreateMatch[1]), payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const skillDecideMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/skills\/([^/]+)\/decide$/);
+  if (request.method === "POST" && skillDecideMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.decideSkill(
+          decodeURIComponent(skillDecideMatch[1]),
+          decodeURIComponent(skillDecideMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const deviceEvidenceMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/device-packages\/([^/]+)\/evidence$/);
+  if (request.method === "POST" && deviceEvidenceMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.recordDeviceEvidence(
+          decodeURIComponent(deviceEvidenceMatch[1]),
+          decodeURIComponent(deviceEvidenceMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/organization/heavy-review/auto-start") {
+    try {
+      sendJson(response, 200, organization.autoStartDueReviews());
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const heavyEvaluateMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/heavy-review\/evaluate$/);
+  if (request.method === "GET" && heavyEvaluateMatch) {
+    try {
+      sendJson(response, 200, organization.evaluateAutoReview(decodeURIComponent(heavyEvaluateMatch[1])));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const revertMatch = url.pathname.match(/^\/api\/governance\/actions\/([^/]+)\/revert$/);
+  if (request.method === "POST" && revertMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, runtimeGovernance.revertAction(decodeURIComponent(revertMatch[1]), payload));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/projects") {
+    sendJson(response, 200, {
+      active: { id: appConfig.project.id, name: appConfig.project.name, status: "active" },
+      inactive: appConfig.inactiveProjects,
+    });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/organization/inspections") {
+    sendJson(response, 200, organization.evaluateInspections());
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/test-manifests") {
+    sendJson(response, 200, { manifests: organization.state().projectTestManifests });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/test-manifests") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { manifest: organization.publishTestManifest(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const manifestDeprecateMatch = url.pathname.match(/^\/api\/test-manifests\/([^/]+)\/deprecate$/);
+  if (request.method === "POST" && manifestDeprecateMatch) {
+    try {
+      const payload = await readJsonBody(request).catch(() => ({}));
+      sendJson(response, 200, organization.deprecateTestManifest(decodeURIComponent(manifestDeprecateMatch[1]), payload));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const decisionCreateMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/decisions$/);  if (request.method === "POST" && decisionCreateMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { mission: organization.requestDecision(decodeURIComponent(decisionCreateMatch[1]), payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const decisionResolveMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/decisions\/([^/]+)\/resolve$/);
+  if (request.method === "POST" && decisionResolveMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.resolveDecision(
+          decodeURIComponent(decisionResolveMatch[1]),
+          decodeURIComponent(decisionResolveMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const overrideExpireMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/overrides\/([^/]+)\/expire$/);
+  if (request.method === "POST" && overrideExpireMatch) {
+    try {
+      sendJson(response, 200, {
+        mission: organization.expireOverride(decodeURIComponent(overrideExpireMatch[1]), decodeURIComponent(overrideExpireMatch[2])),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const riskDebtCloseMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/risk-debts\/([^/]+)\/close$/);
+  if (request.method === "POST" && riskDebtCloseMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.closeRiskDebt(
+          decodeURIComponent(riskDebtCloseMatch[1]),
+          decodeURIComponent(riskDebtCloseMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const waitingCloseMatch = url.pathname.match(/^\/api\/organization\/missions\/([^/]+)\/waiting\/([^/]+)\/close$/);
+  if (request.method === "POST" && waitingCloseMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, {
+        mission: organization.closeWaiting(
+          decodeURIComponent(waitingCloseMatch[1]),
+          decodeURIComponent(waitingCloseMatch[2]),
+          payload,
+        ),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
   const missionActionMatch = url.pathname.match(
-    /^\/api\/organization\/missions\/([^/]+)\/(messages|confirm-baseline|retry|verify-source|approve-merge|approve-deployment|external-evidence|accept-result)$/,
+    /^\/api\/organization\/missions\/([^/]+)\/(messages|workflow-profile|pause|resume|revise-requirements|confirm-baseline|retry|start-heavy-review|verify-source|approve-merge|approve-deployment|external-evidence|accept-result|cancel|emergency-stop|override|risk-debt|quality-decision|record-waiting|device-package)$/,
   );
   if (request.method === "POST" && missionActionMatch) {
     const missionId = decodeURIComponent(missionActionMatch[1]);
@@ -1775,10 +2118,22 @@ const server = http.createServer(async (request, response) => {
       if (action === "messages") {
         const payload = await readJsonBody(request);
         sendJson(response, 202, { mission: organization.addHumanMessage(missionId, payload.content) });
+      } else if (action === "workflow-profile") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 200, { mission: organization.setWorkflowProfile(missionId, payload.profile) });
+      } else if (action === "pause") {
+        sendJson(response, 202, { mission: organization.requestSafePause(missionId), pauseRequested: true });
+      } else if (action === "resume") {
+        sendJson(response, 202, { mission: organization.resumePaused(missionId) });
+      } else if (action === "revise-requirements") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 202, { mission: organization.reviseRequirements(missionId, payload.content) });
       } else if (action === "confirm-baseline") {
         sendJson(response, 202, { mission: organization.confirmBaseline(missionId) });
       } else if (action === "retry") {
         sendJson(response, 202, { mission: organization.retry(missionId) });
+      } else if (action === "start-heavy-review") {
+        sendJson(response, 202, { mission: organization.startHeavyReview(missionId) });
       } else if (action === "verify-source") {
         const source = inspectReleaseSource(organizationProject);
         sendJson(response, 200, { mission: organization.verifyReleaseSource(missionId, source) });
@@ -1791,6 +2146,27 @@ const server = http.createServer(async (request, response) => {
         sendJson(response, 200, { mission: organization.recordExternalEvidence(missionId, payload) });
       } else if (action === "accept-result") {
         sendJson(response, 200, { mission: organization.acceptResult(missionId) });
+      } else if (action === "cancel") {
+        const payload = await readJsonBody(request).catch(() => ({}));
+        sendJson(response, 200, { mission: organization.cancelMission(missionId, payload) });
+      } else if (action === "emergency-stop") {
+        const payload = await readJsonBody(request).catch(() => ({}));
+        sendJson(response, 202, { mission: organization.emergencyStop(missionId, payload), stopRequested: true });
+      } else if (action === "override") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 200, { mission: organization.grantOverride(missionId, payload) });
+      } else if (action === "risk-debt") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 201, { mission: organization.recordRiskDebt(missionId, payload) });
+      } else if (action === "quality-decision") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 200, { mission: organization.decideQuality(missionId, payload) });
+      } else if (action === "record-waiting") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 201, { mission: organization.recordWaiting(missionId, payload) });
+      } else if (action === "device-package") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 201, { mission: organization.generateDevicePackage(missionId, payload) });
       }
     } catch (error) {
       organizationError(response, error);
