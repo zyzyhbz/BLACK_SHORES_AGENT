@@ -65,6 +65,26 @@ test("role JSON accepts fenced output and rejects prose-only output", () => {
   assert.throws(() => extractJsonObject("没有结构化结果"), /不包含可读取/);
 });
 
+test("a returned role output rejected by the contract is traced distinctly", async () => {
+  const { directory, ledger } = tempLedger();
+  const outcomes = [];
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: "没有结构化结果",
+      completeAction(outcome) {
+        outcomes.push(outcome);
+      },
+    }),
+  });
+  service.createMission("调查并修复一个能够稳定复现的页面加载问题");
+  await settle(service);
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "output_rejected");
+  assert.match(outcomes[0].error, /不包含可读取/);
+});
+
 test("mission creation fails closed when no AGENT assignment is available", () => {
   const { directory, ledger } = tempLedger();
   const service = new OrganizationService({

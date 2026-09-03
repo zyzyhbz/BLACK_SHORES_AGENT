@@ -22,6 +22,17 @@ const DEFAULT_CONFIG = {
   ledger: {
     path: "./data/black-shores-ledger.jsonl",
   },
+  runtime: {
+    policyPath: "./runtime-policy.json",
+    backupDirectory: "./data/action-backups",
+    traceDirectory: "./data/action-traces",
+  },
+  channels: {
+    email: {
+      secretsPath: "./data/email-channel.secrets.json",
+      statePath: "./data/email-channel.state.json"
+    },
+  },
   testManifest: {
     id: "ptm-default",
     version: "1.0.0",
@@ -85,6 +96,23 @@ function loadConfig(rootDirectory = __dirname) {
     process.env.BLACK_SHORES_LEDGER || resolveFrom(baseDirectory, config.ledger.path, "./data/black-shores-ledger.jsonl"),
   );
   config.project.testManifest = config.testManifest;
+  const hasPolicyOverride = typeof localConfig.runtime?.policyPath === "string"
+    && localConfig.runtime.policyPath.trim();
+  config.runtime.policyPath = hasPolicyOverride
+    ? resolveFrom(baseDirectory, localConfig.runtime.policyPath, "./runtime-policy.json")
+    : path.resolve(rootDirectory, DEFAULT_CONFIG.runtime.policyPath);
+  config.runtime.backupDirectory = resolveFrom(baseDirectory, config.runtime.backupDirectory, "./data/action-backups");
+  config.runtime.traceDirectory = resolveFrom(baseDirectory, config.runtime.traceDirectory, "./data/action-traces");
+  config.channels.email.secretsPath = resolveFrom(
+    baseDirectory,
+    config.channels.email.secretsPath,
+    "./data/email-channel.secrets.json",
+  );
+  config.channels.email.statePath = resolveFrom(
+    baseDirectory,
+    config.channels.email.statePath,
+    "./data/email-channel.state.json",
+  );
   if (!Array.isArray(config.adapters.custom)) config.adapters.custom = [];
   return config;
 }

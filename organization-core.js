@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
 
-const SYSTEM_VERSION = "0.6.0-mvp";
+const SYSTEM_VERSION = "0.7.0-mvp";
 const PROJECT_ID = "project-default";
 const MANAGER_MODEL = "configured-model";
 const MANAGER_REASONING = "model-default";
@@ -30,7 +30,7 @@ const ALLOWED_STATUS_TRANSITIONS = new Map([
 const ROLE_DEFINITIONS = [
   {
     id: "chief-manager",
-    name: "总管 AGENT",
+    name: "群星的调律者",
     mode: "active",
     contractVersion: "1.0.0",
     mission: "把人类目标组织为可验证结果，并只在真实决策或授权边界升级。",
@@ -151,6 +151,23 @@ function nowIso() {
 function normalizeText(value, maxLength = 20_000) {
   if (typeof value !== "string") return "";
   return value.replace(/\0/g, "").trim().slice(0, maxLength);
+}
+
+function commandReply(action, mission) {
+  if (action === "query_status") {
+    return mission
+      ? `${mission.title}：${mission.status}。${mission.statusReason || "状态已刷新。"}`
+      : "当前没有 Mission。可以直接下达新的结果目标。";
+  }
+  const replies = {
+    create_mission: "Mission 已建立，需求明确岗开始整理需求基线。",
+    add_requirement_message: "补充内容已进入同一 Mission，需求明确岗将重新整理。",
+    set_workflow_profile: "工作流档位已更新。",
+    confirm_baseline: "需求基线已确认，群星的调律者开始建立任务章程。",
+    retry_blocked: "已按恢复预算启动续作。",
+    start_heavy_review: "重度全量回顾已启动。",
+  };
+  return replies[action] || "命令已执行。";
 }
 
 function resolveWorkflowProfile(requested, goal) {
@@ -664,7 +681,7 @@ class OrganizationService {
 
   setAssignments({ managerAssignment, roleAssignments = {} }) {
     if (!managerAssignment?.adapterId) {
-      throw Object.assign(new Error("总管 AGENT 任职缺少适配器"), { statusCode: 400 });
+      throw Object.assign(new Error("群星的调律者任职缺少适配器"), { statusCode: 400 });
     }
     this.managerAssignment = { ...managerAssignment };
     this.roleAssignments = Object.fromEntries(
@@ -776,15 +793,21 @@ class OrganizationService {
     return this.mission(missionId);
   }
 
-  executeCommand({ content, missionId = null }) {
+  executeCommand({ content, missionId = null, channel = "local-workbench" }) {
     const normalized = normalizeText(content, 12_000);
     if (!normalized) throw Object.assign(new Error("命令不能为空"), { statusCode: 400 });
     const commandId = makeId("command");
-    const selectedMission = missionId ? this._requireMission(missionId) : this.state().missions[0] || null;
+    const missions = this.state().missions;
+    const activeMission = missions.find((mission) => !TERMINAL_STATUSES.has(mission.status)) || null;
+    const statusQuery = /^(?:查看|查询|汇报)?(?:当前)?(?:任务|Mission)?状态[？?。\s]*$/i.test(normalized);
+    const selectedMission = missionId
+      ? this._requireMission(missionId)
+      : activeMission || (statusQuery ? missions[0] || null : null);
+    const normalizedChannel = normalizeText(channel, 80) || "local-workbench";
     this.ledger.append("command.requested", {
       missionId: selectedMission?.id || null,
       actorRoleId: "human-owner",
-      payload: { id: commandId, channel: "local-workbench", content: normalized },
+      payload: { id: commandId, channel: normalizedChannel, content: normalized },
     });
     try {
       let action;
@@ -811,7 +834,7 @@ class OrganizationService {
         if (!selectedMission) throw Object.assign(new Error("没有可恢复的 Mission"), { statusCode: 409 });
         mission = this.retry(selectedMission.id);
         action = "retry_blocked";
-      } else if (/^(?:查看|查询|汇报)?(?:当前)?(?:任务|Mission)?状态[？?。\s]*$/i.test(normalized)) {
+      } else if (statusQuery) {
         mission = selectedMission;
         action = "query_status";
       } else if (!selectedMission || /^(?:新建|创建|开始)(?:一个)?(?:任务|Mission)[:：\s]/i.test(normalized)) {
@@ -823,13 +846,14 @@ class OrganizationService {
       } else {
         throw Object.assign(new Error(`当前状态 ${selectedMission.status} 无法解释这条命令，请明确说明要查询状态、切换模式或执行门禁动作`), { statusCode: 409 });
       }
+      const reply = commandReply(action, mission);
       this.ledger.append("command.executed", {
         missionId: mission?.id || selectedMission?.id || null,
         actorRoleId: "chief-manager",
         causationId: commandId,
-        payload: { id: commandId, action, status: mission?.status || null },
+        payload: { id: commandId, action, status: mission?.status || null, reply, channel: normalizedChannel },
       });
-      return { commandId, action, mission: mission ? publicMission(mission) : null };
+      return { commandId, action, reply, mission: mission ? publicMission(mission) : null };
     } catch (error) {
       this.ledger.append("command.rejected", {
         missionId: selectedMission?.id || null,
@@ -885,7 +909,7 @@ class OrganizationService {
       actorRoleId: "human-owner",
       payload: { version: mission.baseline.version, humanExpression: "通过工作台明确确认" },
     });
-    this._setStatus(missionId, "planning", "需求基线已确认，总管建立任务章程");
+    this._setStatus(missionId, "planning", "需求基线已确认，群星的调律者建立任务章程");
     this._queueManagerPlan(missionId);
     return this.mission(missionId);
   }
@@ -1270,7 +1294,7 @@ class OrganizationService {
         : ["engineering", "independent-reviewer", "tester"];
       const ownerIds = Array.isArray(parsed.workItems) ? parsed.workItems.map((item) => item.ownerRoleId) : [];
       if (!parsed.charter || !requiredOwners.every((owner) => ownerIds.includes(owner))) {
-        throw new Error(`总管输出缺少 Charter 或 ${requiredOwners.join("/")} WorkItem`);
+        throw new Error(`群星的调律者输出缺少 Charter 或 ${requiredOwners.join("/")} WorkItem`);
       }
       this.ledger.append("charter.created", {
         missionId,
@@ -1298,7 +1322,7 @@ class OrganizationService {
         missionId,
         actorRoleId: "chief-manager",
         causationId: run.id,
-        payload: { authorType: "role", roleId: "chief-manager", roleName: "总管 AGENT", content: normalizeText(parsed.message, 6000) || "任务章程与分工已建立。" },
+        payload: { authorType: "role", roleId: "chief-manager", roleName: "群星的调律者", content: normalizeText(parsed.message, 6000) || "任务章程与分工已建立。" },
       });
       this._setStatus(missionId, "executing", "工程执行岗开始处理已确认工作项");
       this._continueAfterCurrentRun(missionId, () => this._queueEngineeringRun(missionId));
@@ -1664,6 +1688,11 @@ class OrganizationService {
     const task = Promise.resolve()
       .then(() => this.runRole({
         role,
+        missionId,
+        goal: mission.goal,
+        scope: mission.workItems
+          .filter((item) => item.ownerRoleId === roleId && item.status !== "completed")
+          .map((item) => item.title),
         adapterId: assignment.adapterId,
         prompt,
         cwd: this.project.workingDirectory,
@@ -1674,6 +1703,7 @@ class OrganizationService {
         onActivity,
       }))
       .then((result) => {
+        active.roleResult = result;
         const parsed = extractJsonObject(result.output);
         const finalCheckpoint = this.ledger.append("run.checkpointed", {
           missionId,
@@ -1699,9 +1729,17 @@ class OrganizationService {
         });
         runCompleted = true;
         onSuccess(this._requireMission(missionId), parsed, { id: runId, result });
+        result.completeAction?.({
+          status: "completed",
+          summary: normalizeText(parsed.message || parsed.result || parsed.verdict || result.output, 6000),
+        });
       })
       .catch((error) => {
         const errorMessage = normalizeText(error?.message || String(error), 12_000);
+        active.roleResult?.completeAction?.({
+          status: "output_rejected",
+          error: errorMessage,
+        });
         if (runCompleted) {
           this.ledger.append("run.output_rejected", {
             missionId,

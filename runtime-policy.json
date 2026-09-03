@@ -1,0 +1,36 @@
+{
+  "version": "1.0.0",
+  "controller": {
+    "roleId": "chief-manager",
+    "displayName": "群星的调律者"
+  },
+  "actionTrace": {
+    "required": true,
+    "format": "jsonl",
+    "oneFilePerRole": true,
+    "directory": "./data/action-traces",
+    "requiredFields": [
+      "actionModel",
+      "actionTime",
+      "actionObject",
+      "actionScope",
+      "actionGoal",
+      "actionResult"
+    ]
+  },
+  "backup": {
+    "requiredBeforeMutation": true,
+    "roles": ["engineering", "direct-agent"],
+    "format": "zip",
+    "directory": "./data/action-backups",
+    "exclude": [
+      ".git/**",
+      "node_modules/**",
+      "dist/**",
+      "build/**",
+      "coverage/**",
+      ".next/**",
+      "*.log"
+    ]
+  }
+}

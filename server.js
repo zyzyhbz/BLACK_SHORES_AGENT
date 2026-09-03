@@ -9,6 +9,8 @@ const {
   OrganizationService,
 } = require("./organization-core");
 const { loadConfig } = require("./config");
+const { RuntimeGovernance } = require("./runtime-governance");
+const { EmailBridge } = require("./email-bridge");
 
 const HOST = "127.0.0.1";
 const requestedPort = Number.parseInt(process.env.BLACK_SHORES_PORT || "4782", 10);
@@ -701,6 +703,8 @@ function configurationForDisk() {
     manager: appConfig.manager,
     roles: appConfig.roles,
     ledger: { path: appConfig.ledger.path },
+    runtime: appConfig.runtime,
+    channels: appConfig.channels,
     testManifest: appConfig.testManifest,
     adapters: appConfig.adapters,
   };
@@ -1167,6 +1171,33 @@ async function handleAgentRun(request, response, adapter) {
     return;
   }
 
+  let governanceAction;
+  try {
+    governanceAction = await runtimeGovernance.begin({
+      roleId: "direct-agent",
+      roleName: "直接 AGENT 调用",
+      missionId: payload.missionId || null,
+      adapterId: adapter.id,
+      model: runSettings.model,
+      reasoningEffort: runSettings.reasoningEffort,
+      goal: prompt,
+      scope: Array.isArray(payload.scope) && payload.scope.length
+        ? payload.scope
+        : ["直接调用指定工作目录"],
+      workingDirectory,
+    });
+  } catch (error) {
+    activeExclusiveRuns.delete(adapter.id);
+    sendJson(response, 500, { error: error.message });
+    return;
+  }
+  let actionRecorded = false;
+  function recordAction(outcome) {
+    if (actionRecorded) return;
+    actionRecorded = true;
+    runtimeGovernance.complete(governanceAction, outcome);
+  }
+
   response.writeHead(200, {
     "Content-Type": "application/x-ndjson; charset=utf-8",
     "Cache-Control": "no-store",
@@ -1214,6 +1245,7 @@ async function handleAgentRun(request, response, adapter) {
     if (!completed) {
       abortedByClient = true;
       stopProcessTree(child);
+      recordAction({ status: "interrupted", error: "客户端断开，已终止直接调用" });
     }
   });
 
@@ -1249,6 +1281,7 @@ async function handleAgentRun(request, response, adapter) {
   child.on("error", (error) => {
     completed = true;
     activeExclusiveRuns.delete(adapter.id);
+    recordAction({ status: "failed", error: error.message || String(error) });
     writeEvent(response, { type: "hub.error", message: error.message });
     if (!response.writableEnded && !response.destroyed) response.end();
   });
@@ -1257,6 +1290,16 @@ async function handleAgentRun(request, response, adapter) {
     completed = true;
     activeExclusiveRuns.delete(adapter.id);
     if (adapter.outputFormat !== "text" && stdoutBuffer.trim()) processLine(stdoutBuffer);
+    recordAction(
+      abortedByClient
+        ? { status: "interrupted", error: "客户端断开，已终止直接调用" }
+        : code === 0
+          ? { status: "completed", summary: stdoutBuffer }
+          : {
+              status: "failed",
+              error: stderrBuffer.trim() || `${adapter.label} 退出，代码 ${code ?? "未知"}`,
+            },
+    );
     if (!abortedByClient && code !== 0) {
       writeEvent(response, {
         type: "hub.error",
@@ -1412,17 +1455,80 @@ const organizationProject = {
   testManifest: appConfig.testManifest,
   workingDirectory: appConfig.project.path,
 };
+const runtimeGovernance = new RuntimeGovernance({
+  policyPath: appConfig.runtime.policyPath,
+  project: organizationProject,
+  ledger: organizationLedger,
+  backupDirectory: appConfig.runtime.backupDirectory,
+  traceDirectory: appConfig.runtime.traceDirectory,
+});
 const organization = new OrganizationService({
   ledger: organizationLedger,
   project: organizationProject,
   managerAssignment,
   roleAssignments,
-  runRole: ({ adapterId, prompt, cwd, model, reasoningEffort, onActivity }) => {
+  runRole: async ({
+    role,
+    missionId,
+    goal,
+    scope,
+    adapterId,
+    prompt,
+    cwd,
+    model,
+    reasoningEffort,
+    runId,
+    invocationId,
+    onActivity,
+  }) => {
     const adapter = adapters[adapterId];
-    if (!adapter) return Promise.reject(new Error(`未知 AGENT 适配器：${adapterId}`));
-    return runAdapterBuffered(adapter, { prompt, cwd, model, reasoningEffort, onActivity });
+    if (!adapter) throw new Error(`未知 AGENT 适配器：${adapterId}`);
+    const action = await runtimeGovernance.begin({
+      roleId: role.id,
+      roleName: role.name,
+      missionId,
+      runId,
+      invocationId,
+      adapterId,
+      model,
+      reasoningEffort,
+      goal,
+      scope: scope?.length ? scope : role.may,
+    });
+    let result;
+    try {
+      result = await runAdapterBuffered(adapter, {
+        prompt,
+        cwd,
+        model,
+        reasoningEffort,
+        onActivity,
+      });
+    } catch (error) {
+      runtimeGovernance.complete(action, {
+        status: "failed",
+        error: error.message || String(error),
+      });
+      throw error;
+    }
+    let actionCompleted = false;
+    return {
+      ...result,
+      completeAction(outcome) {
+        if (actionCompleted) return;
+        actionCompleted = true;
+        runtimeGovernance.complete(action, outcome);
+      },
+    };
   },
 });
+const emailBridge = new EmailBridge({
+  secretsPath: appConfig.channels.email.secretsPath,
+  statePath: appConfig.channels.email.statePath,
+  organization,
+  ledger: organizationLedger,
+});
+emailBridge.start();
 
 function gitValue(cwd, args, { timeout = 30_000 } = {}) {
   const result = spawnSync("git", args, {
@@ -1532,6 +1638,8 @@ const server = http.createServer(async (request, response) => {
         managerReasoning: managerAssignment.reasoningEffort,
         executionReady: managerAssignment.ready,
       },
+      governance: runtimeGovernance.status(),
+      channels: { email: emailBridge.publicState() },
     });
     return;
   }
@@ -1557,6 +1665,44 @@ const server = http.createServer(async (request, response) => {
       configured: appConfig.configured,
       activeRunIds: organization.state().activeRunIds,
     });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/governance/status") {
+    sendJson(response, 200, runtimeGovernance.status());
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/channels/email") {
+    sendJson(response, 200, emailBridge.publicState());
+    return;
+  }
+
+  if (request.method === "PUT" && url.pathname === "/api/channels/email") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, emailBridge.configure(payload));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/channels/email/test") {
+    try {
+      sendJson(response, 200, await emailBridge.testConnection());
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/channels/email/poll") {
+    try {
+      sendJson(response, 200, await emailBridge.poll());
+    } catch (error) {
+      organizationError(response, error);
+    }
     return;
   }
 
@@ -1602,6 +1748,7 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 202, organization.executeCommand({
         content: payload.content,
         missionId: payload.missionId || null,
+        channel: payload.channel || "tuner-chat",
       }));
     } catch (error) {
       organizationError(response, error);
@@ -1679,3 +1826,5 @@ server.listen(PORT, HOST, () => {
     );
   }
 });
+
+server.on("close", () => emailBridge.stop());

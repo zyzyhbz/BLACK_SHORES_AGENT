@@ -105,6 +105,13 @@ test("HTTP surface serves the workbench and rejects invalid mission input", asyn
   assert.equal(health.organization.executionReady, false);
   assert.equal(health.configuration.configured, true);
 
+  const governance = await (await fetch(`${server.origin}/api/governance/status`)).json();
+  assert.equal(governance.controllerName, "群星的调律者");
+  assert.equal(governance.required, true);
+  const email = await (await fetch(`${server.origin}/api/channels/email`)).json();
+  assert.equal(email.enabled, false);
+  assert.equal(Object.hasOwn(email, "password"), false);
+
   const pageResponse = await fetch(`${server.origin}/`);
   assert.equal(pageResponse.status, 200);
   assert.match(await pageResponse.text(), /黑海岸 AGENT 系统/);
@@ -220,6 +227,21 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   assert.equal(mission.runs[0].adapterId, "vendor-agent");
   assert.equal(mission.runs[0].model, "vendor/model-x");
   assert.match(mission.messages.at(-1).content, /验收环境/);
+
+  const directResponse = await fetch(`${server.origin}/api/agents/vendor-agent/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "直接检查当前项目", cwd: directory }),
+  });
+  assert.equal(directResponse.status, 200);
+  assert.match(await directResponse.text(), /hub.exit/);
+  const governance = await (await fetch(`${server.origin}/api/governance/status`)).json();
+  assert.equal(governance.backup.archiveCount, 1);
+  const directTrace = governance.actionTrace.files.find((file) => file.endsWith("direct-agent.jsonl"));
+  assert.ok(directTrace);
+  const directRecord = JSON.parse(fs.readFileSync(directTrace, "utf8").trim());
+  assert.equal(directRecord.actionObject.roleId, "direct-agent");
+  assert.equal(directRecord.actionResult.status, "completed");
 });
 
 test("configuration API persists manager and per-role assignments and registers a new AGENT", async (context) => {

@@ -19,6 +19,17 @@
   "ledger": {
     "path": "./data/black-shores-ledger.jsonl"
   },
+  "runtime": {
+    "policyPath": "./runtime-policy.json",
+    "backupDirectory": "./data/action-backups",
+    "traceDirectory": "./data/action-traces"
+  },
+  "channels": {
+    "email": {
+      "secretsPath": "./data/email-channel.secrets.json",
+      "statePath": "./data/email-channel.state.json"
+    }
+  },
   "testManifest": {
     "id": "ptm-default",
     "version": "1.0.0",

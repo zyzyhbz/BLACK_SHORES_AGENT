@@ -39,9 +39,13 @@ let selectedMissionId = "";
 let organizationState = null;
 let healthState = null;
 let configurationState = null;
+let emailState = null;
+let governanceState = null;
 let ledgerEvents = [];
 let loading = true;
 let requestInFlight = false;
+let tunerInFlight = false;
+let emailRequestInFlight = false;
 let toastTimer = null;
 let pollTimer = null;
 let assignmentDraft = null;
@@ -57,6 +61,13 @@ const mobileBackdrop = document.getElementById("mobileBackdrop");
 const systemState = document.getElementById("systemState");
 const detailDialog = document.getElementById("detailDialog");
 const detailContent = document.getElementById("detailContent");
+const appShell = document.getElementById("appShell");
+const tunerDock = document.getElementById("tunerDock");
+const tunerBackdrop = document.getElementById("tunerBackdrop");
+const tunerInput = document.getElementById("tunerInput");
+const tunerMessages = document.getElementById("tunerMessages");
+const tunerSubmitButton = document.getElementById("tunerSubmitButton");
+const tunerLayoutQuery = window.matchMedia("(max-width: 1120px)");
 
 function icon(name, className = "") {
   return `<i data-lucide="${name}"${className ? ` class="${className}"` : ""} aria-hidden="true"></i>`;
@@ -178,7 +189,7 @@ function renderEmptyWorkbench() {
   return `
     <section class="workbench-empty" aria-labelledby="newMissionTitle">
       <div class="empty-context">
-        <span class="section-kicker">总管 AGENT · 命令入口</span>
+        <span class="section-kicker">群星的调律者 · 命令入口</span>
         <h2 id="newMissionTitle">你要组织完成什么结果？</h2>
         <p>直接描述目标，或在同一句中指定轻度、重度或自动模式。</p>
       </div>
@@ -201,7 +212,7 @@ function renderEmptyWorkbench() {
         </div>
       </form>
       <div class="operating-baseline" aria-label="当前运行基线">
-        <div><span>总管任职</span><strong>${escapeHtml(managerSummary())}</strong></div>
+        <div><span>调律者任职</span><strong>${escapeHtml(managerSummary())}</strong></div>
         <div><span>权威账本</span><strong>本地单机</strong></div>
         <div><span>项目</span><strong>${escapeHtml(organizationState?.project?.name || "未配置")}</strong></div>
         <div><span>发布权限</span><strong>人类保留</strong></div>
@@ -233,6 +244,86 @@ function renderMessage(message) {
       <p>${escapeHtml(message.content).replaceAll("\n", "<br />")}</p>
       ${questions}
     </article>`;
+}
+
+function commandConversation() {
+  const missionId = activeMission()?.id;
+  return ledgerEvents
+    .filter((event) => {
+      if (["command.requested", "command.executed", "command.rejected"].includes(event.type)) return true;
+      return event.type === "message.recorded"
+        && event.missionId === missionId
+        && event.payload.authorType === "role";
+    })
+    .slice(-40);
+}
+
+function renderTunerDock() {
+  const mission = activeMission();
+  const status = document.getElementById("tunerStatus");
+  const context = document.getElementById("tunerContext");
+  const governance = document.getElementById("tunerGovernance");
+  const emailIndicator = document.getElementById("emailChannelIndicator");
+  const conversation = commandConversation();
+  const lastEventId = conversation.at(-1)?.id || "";
+  const previousEventId = tunerMessages.dataset.lastEventId || "";
+  const nearBottom = tunerMessages.scrollHeight - tunerMessages.scrollTop - tunerMessages.clientHeight < 80;
+
+  if (status) {
+    status.textContent = organizationState?.authority?.executionReady
+      ? `${managerSummary()} · 在线`
+      : "等待配置可用 AGENT";
+  }
+  if (context) {
+    context.innerHTML = mission
+      ? `<span>当前 Mission</span><strong>${escapeHtml(mission.title)}</strong>${statusPill(mission.status)}`
+      : `<span>当前上下文</span><strong>新目标</strong><small>命令将建立新的 Mission</small>`;
+  }
+  if (tunerMessages) {
+    tunerMessages.innerHTML = conversation.length
+      ? conversation.map((event) => {
+          if (event.type === "message.recorded") {
+            const questions = Array.isArray(event.payload.questions) && event.payload.questions.length
+              ? `<div class="tuner-questions">${event.payload.questions.map((item, index) => `<span><b>${index + 1}</b>${escapeHtml(item.question || item)}</span>`).join("")}</div>`
+              : "";
+            return `<article class="tuner-message tuner-message-agent"><header><span>${escapeHtml(event.payload.roleName || "组织角色")}</span><time>${formatTime(event.at)}</time></header><p>${escapeHtml(event.payload.content || "角色已返回结果").replaceAll("\n", "<br />")}</p>${questions}</article>`;
+          }
+          if (event.type === "command.requested") {
+            const channel = event.payload.channel === "email" ? "邮箱" : "软件";
+            return `<article class="tuner-message tuner-message-human"><header><span>你 · ${channel}</span><time>${formatTime(event.at)}</time></header><p>${escapeHtml(event.payload.content).replaceAll("\n", "<br />")}</p></article>`;
+          }
+          const rejected = event.type === "command.rejected";
+          const content = rejected ? event.payload.error : event.payload.reply;
+          return `<article class="tuner-message tuner-message-agent ${rejected ? "tuner-message-error" : ""}"><header><span>群星的调律者</span><time>${formatTime(event.at)}</time></header><p>${escapeHtml(content || (rejected ? "命令被拒绝" : "命令已执行")).replaceAll("\n", "<br />")}</p>${event.missionId ? `<button type="button" data-tuner-mission="${escapeHtml(event.missionId)}">${escapeHtml(event.missionId)}</button>` : ""}</article>`;
+        }).join("")
+      : `<div class="tuner-empty">群星的调律者已就位。所有命令会进入统一账本，并由组织工作流执行。</div>`;
+    tunerMessages.dataset.lastEventId = lastEventId;
+    if (!previousEventId || previousEventId !== lastEventId || nearBottom) {
+      tunerMessages.scrollTop = tunerMessages.scrollHeight;
+    }
+    tunerMessages.querySelectorAll("[data-tuner-mission]").forEach((button) => {
+      button.addEventListener("click", () => {
+        selectedMissionId = button.dataset.tunerMission;
+        switchView("workbench");
+      });
+    });
+  }
+  if (governance) {
+    const traceCount = governanceState?.actionTrace?.roleLogCount || 0;
+    const archiveCount = governanceState?.backup?.archiveCount || 0;
+    governance.innerHTML = `
+      <span>${icon("shield-check")} 强制治理已启用</span>
+      <small>${archiveCount} 个修改前备份 · ${traceCount} 份角色日志</small>`;
+  }
+  if (emailIndicator) {
+    const enabled = emailState?.enabled === true;
+    emailIndicator.className = `channel-indicator ${enabled ? (emailState.status === "error" ? "error" : "online") : ""}`;
+  }
+  if (tunerSubmitButton) {
+    tunerSubmitButton.disabled = tunerInFlight;
+    tunerSubmitButton.innerHTML = icon(tunerInFlight ? "loader-circle" : "arrow-up", tunerInFlight ? "spin" : "");
+  }
+  refreshIcons();
 }
 
 function listBlock(title, items) {
@@ -380,7 +471,7 @@ function renderReleaseGate(mission) {
 
 function renderWorkItems(mission) {
   if (!mission.workItems?.length) {
-    return `<div class="quiet-empty">需求基线确认后，总管 AGENT 才会建立任务章程与分工。</div>`;
+    return `<div class="quiet-empty">需求基线确认后，群星的调律者才会建立任务章程与分工。</div>`;
   }
   return mission.workItems
     .map(
@@ -492,7 +583,7 @@ function renderMissions() {
                   <button type="button" class="mission-row" data-mission-id="${escapeHtml(mission.id)}">
                     <span><strong>${escapeHtml(mission.title)}</strong><small>${escapeHtml(mission.id)}</small></span>
                     ${statusPill(mission.status)}
-                    <span>${escapeHtml(mission.runs?.at(-1)?.roleName || "总管 AGENT")}</span>
+                    <span>${escapeHtml(mission.runs?.at(-1)?.roleName || "群星的调律者")}</span>
                     <time>${formatTime(mission.updatedAt)}</time>
                     ${icon("chevron-right")}
                   </button>`,
@@ -517,7 +608,7 @@ function renderOrganization() {
       <div class="org-map">
         <div class="org-owner"><span class="org-node-icon">人</span><div><strong>人类负责人</strong><small>目标、基线、验收与发布授权</small></div></div>
         <div class="org-line"></div>
-        <div class="org-manager"><span class="org-node-icon">总</span><div><strong>总管 AGENT</strong><small>${escapeHtml(managerSummary())} · ${organizationState?.authority?.executionReady ? "active" : "unconfigured"}</small></div></div>
+        <div class="org-manager"><span class="org-node-icon">调</span><div><strong>群星的调律者</strong><small>${escapeHtml(managerSummary())} · ${organizationState?.authority?.executionReady ? "active" : "unconfigured"}</small></div></div>
       </div>
       ${groups
         .map(([mode, label]) => {
@@ -571,6 +662,14 @@ function eventLabel(event) {
     "release_candidate.invalidated": "作废发布候选",
     "external_evidence.recorded": "记录外部验收证据",
     "approval.recorded": "记录人类授权",
+    "action.safeguard_started": "建立动作保护点",
+    "action.safeguard_failed": "动作保护失败",
+    "role_action.recorded": "写入角色动作留痕",
+    "email.channel_configured": "配置邮箱通道",
+    "email.command_received": "接收邮箱命令",
+    "email.command_ignored": "忽略未授权邮件",
+    "email.notification_sent": "发送决策邮件",
+    "email.channel_error": "邮箱通道异常",
   };
   return labels[event.type] || event.type;
 }
@@ -639,7 +738,7 @@ function assignmentRow({ key, label, subtitle, assignment, effective, inherited 
     <div class="assignment-row" data-assignment-key="${escapeHtml(key)}">
       <div class="assignment-role">
         <strong>${escapeHtml(label)}</strong>
-        <small>${escapeHtml(subtitle || (inherited ? "继承总管任职" : "独立任职"))}</small>
+        <small>${escapeHtml(subtitle || (inherited ? "继承调律者任职" : "独立任职"))}</small>
       </div>
       <label class="field-label">
         <span>适配器</span>
@@ -654,7 +753,7 @@ function assignmentRow({ key, label, subtitle, assignment, effective, inherited 
         <span>推理强度</span>
         <select data-assignment-field="reasoningEffort" ${disabled}>${reasoningOptions(agent, model, reasoning)}</select>
       </label>
-      ${key === "manager" ? '<span class="assignment-scope">组织默认</span>' : `<label class="inherit-toggle"><input type="checkbox" data-assignment-inherit ${inherited ? "checked" : ""} /><span>继承总管</span></label>`}
+      ${key === "manager" ? '<span class="assignment-scope">组织默认</span>' : `<label class="inherit-toggle"><input type="checkbox" data-assignment-inherit ${inherited ? "checked" : ""} /><span>继承调律者</span></label>`}
     </div>`;
 }
 
@@ -671,7 +770,7 @@ function renderAssignmentConsole() {
   const managerEffective = organizationState?.authority || {};
   const managerRow = assignmentRow({
     key: "manager",
-    label: "总管 AGENT",
+    label: "群星的调律者",
     subtitle: "全部未单独任职角色的默认配置",
     assignment: data.manager,
     effective: {
@@ -685,7 +784,7 @@ function renderAssignmentConsole() {
     return assignmentRow({
       key: role.id,
       label: role.name,
-      subtitle: hasOverride ? `${role.id} · 独立任职` : `${role.id} · 继承总管`,
+      subtitle: hasOverride ? `${role.id} · 独立任职` : `${role.id} · 继承调律者`,
       assignment: hasOverride ? data.roles[role.id] : data.manager,
       effective: organizationState?.roleAssignments?.[role.id],
       inherited: !hasOverride,
@@ -714,8 +813,8 @@ function renderResources() {
     <section class="page-section">
       <header class="section-heading"><div><span class="section-kicker">管理诊断入口</span><h2>AGENT 资源</h2></div><div class="section-actions"><span class="resource-policy">模型厂商不限</span><button type="button" class="button button-secondary" data-action="new-agent">${icon("plus")}新增 AGENT</button></div></header>
       <div class="manager-assignment">
-        <div>${icon("crown")}<span><small>当前总管任职</small><strong>${escapeHtml(managerSummary())}</strong></span></div>
-        <div><span>角色</span><strong>总管 AGENT</strong></div>
+        <div>${icon("crown")}<span><small>当前调律者任职</small><strong>${escapeHtml(managerSummary())}</strong></span></div>
+        <div><span>角色</span><strong>群星的调律者</strong></div>
         <div><span>适配器</span><strong>${escapeHtml(authority.managerAdapterLabel || authority.managerAdapter || "未配置")}</strong></div>
         <div><span>降级策略</span><strong>失败即阻塞，不静默降级</strong></div>
       </div>
@@ -824,7 +923,7 @@ function bindAssignmentEvents() {
         field.disabled = inherited;
       });
       const subtitle = row.querySelector(".assignment-role small");
-      if (subtitle) subtitle.textContent = `${row.dataset.assignmentKey} · ${inherited ? "继承总管" : "独立任职"}`;
+      if (subtitle) subtitle.textContent = `${row.dataset.assignmentKey} · ${inherited ? "继承调律者" : "独立任职"}`;
       if (inherited) syncInheritedRowsFromManager();
       else captureAssignmentDraft();
     });
@@ -921,6 +1020,120 @@ async function submitAgentConfig(event) {
   }
 }
 
+function syncEmailProviderFields(form) {
+  const custom = form.elements.provider.value === "custom";
+  form.querySelectorAll("[data-custom-email]").forEach((field) => {
+    field.disabled = !custom;
+  });
+  form.querySelector("[data-email-custom-fields]")?.classList.toggle("disabled", !custom);
+}
+
+function emailConfigurationPayload(form) {
+  const values = new FormData(form);
+  return {
+    enabled: values.get("enabled") === "on",
+    provider: values.get("provider"),
+    address: values.get("address"),
+    ownerAddress: values.get("ownerAddress"),
+    username: values.get("username"),
+    password: values.get("password"),
+    allowedSenders: [values.get("ownerAddress")],
+    pollIntervalSeconds: Number(values.get("pollIntervalSeconds")),
+    imap: {
+      host: form.elements.imapHost.value,
+      port: Number(form.elements.imapPort.value),
+      secure: form.elements.imapSecure.checked,
+    },
+    smtp: {
+      host: form.elements.smtpHost.value,
+      port: Number(form.elements.smtpPort.value),
+      secure: form.elements.smtpSecure.checked,
+    },
+  };
+}
+
+async function persistEmailConfiguration(form) {
+  const state = await api("/api/channels/email", {
+    method: "PUT",
+    body: JSON.stringify(emailConfigurationPayload(form)),
+  });
+  emailState = state;
+  return state;
+}
+
+async function runEmailAction(form, action) {
+  if (emailRequestInFlight) return;
+  emailRequestInFlight = true;
+  form.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  try {
+    await persistEmailConfiguration(form);
+    if (action === "test") {
+      await api("/api/channels/email/test", { method: "POST" });
+      showToast("邮箱收发连接测试通过");
+    } else if (action === "poll") {
+      await api("/api/channels/email/poll", { method: "POST" });
+      showToast("已完成一次邮箱收取与通知发送");
+    } else {
+      detailDialog.close();
+      showToast("邮箱通道配置已保存在本机");
+    }
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    emailRequestInFlight = false;
+    form.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+function openEmailConfigDialog() {
+  const state = emailState || {};
+  const selected = (value) => state.provider === value ? "selected" : "";
+  const checked = (value) => value ? "checked" : "";
+  detailContent.innerHTML = `
+    <header class="dialog-header"><div><span class="section-kicker">远程命令与决策回流</span><h2>邮箱通道</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭" title="关闭">${icon("x")}</button></header>
+    <div class="channel-summary ${state.status === "error" ? "channel-summary-error" : ""}">
+      <span>${icon(state.enabled ? "radio" : "circle-off")} ${state.enabled ? "通道已启用" : "通道未启用"}</span>
+      <small>${escapeHtml(state.lastError || (state.lastPollAt ? `最近收取 ${formatTime(state.lastPollAt)}` : "尚未连接邮箱"))}</small>
+    </div>
+    <form class="agent-config-form email-config-form" id="emailConfigForm">
+      <label class="check-line channel-enable"><input type="checkbox" name="enabled" ${checked(state.enabled)} /><span>启用邮箱远程命令与决策通知</span></label>
+      <div class="form-grid">
+        <label class="field-label"><span>邮箱服务商</span><select name="provider"><option value="qq" ${selected("qq")}>QQ 邮箱</option><option value="163" ${selected("163")}>163 邮箱</option><option value="outlook" ${selected("outlook")}>Outlook</option><option value="gmail" ${selected("gmail")}>Gmail</option><option value="custom" ${selected("custom")}>自定义</option></select></label>
+        <label class="field-label"><span>轮询间隔（秒）</span><input type="number" name="pollIntervalSeconds" min="15" max="600" value="${escapeHtml(state.pollIntervalSeconds || 30)}" required /></label>
+        <label class="field-label"><span>系统邮箱</span><input type="email" name="address" value="${escapeHtml(state.address || "")}" placeholder="agent@example.com" /></label>
+        <label class="field-label"><span>你的邮箱</span><input type="email" name="ownerAddress" value="${escapeHtml(state.ownerAddress || "")}" placeholder="owner@example.com" /></label>
+        <label class="field-label"><span>登录用户名</span><input type="text" name="username" value="${escapeHtml(state.username || state.address || "")}" placeholder="通常与系统邮箱一致" /></label>
+        <label class="field-label"><span>授权码或应用密码</span><input type="password" name="password" placeholder="${state.hasPassword ? "已保存，留空表示不修改" : "仅保存在本机"}" autocomplete="new-password" /></label>
+      </div>
+      <section class="email-provider-fields" data-email-custom-fields>
+        <div class="form-grid">
+          <label class="field-label"><span>IMAP 主机</span><input type="text" name="imapHost" data-custom-email value="${escapeHtml(state.imap?.host || "")}" /></label>
+          <label class="field-label"><span>IMAP 端口</span><input type="number" name="imapPort" data-custom-email min="1" max="65535" value="${escapeHtml(state.imap?.port || 993)}" /></label>
+          <label class="check-line"><input type="checkbox" name="imapSecure" data-custom-email ${checked(state.imap?.secure !== false)} /><span>IMAP TLS</span></label>
+          <span></span>
+          <label class="field-label"><span>SMTP 主机</span><input type="text" name="smtpHost" data-custom-email value="${escapeHtml(state.smtp?.host || "")}" /></label>
+          <label class="field-label"><span>SMTP 端口</span><input type="number" name="smtpPort" data-custom-email min="1" max="65535" value="${escapeHtml(state.smtp?.port || 465)}" /></label>
+          <label class="check-line"><input type="checkbox" name="smtpSecure" data-custom-email ${checked(state.smtp?.secure !== false)} /><span>SMTP TLS</span></label>
+        </div>
+      </section>
+      <footer class="dialog-actions email-dialog-actions"><button type="button" class="button button-secondary" data-email-action="poll">${icon("inbox")}立即收取</button><button type="button" class="button button-secondary" data-email-action="test">${icon("plug-zap")}保存并测试</button><button type="submit" class="button button-primary">${icon("save")}保存</button></footer>
+    </form>`;
+  detailDialog.showModal();
+  const form = document.getElementById("emailConfigForm");
+  detailContent.querySelector("[data-close-dialog]")?.addEventListener("click", () => detailDialog.close());
+  form.elements.provider.addEventListener("change", () => syncEmailProviderFields(form));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    runEmailAction(form, "save");
+  });
+  form.querySelectorAll("[data-email-action]").forEach((button) => {
+    button.addEventListener("click", () => runEmailAction(form, button.dataset.emailAction));
+  });
+  syncEmailProviderFields(form);
+  refreshIcons();
+}
+
 function captureEditorFocus() {
   const editor = document.activeElement;
   if (!(editor instanceof HTMLTextAreaElement) || editor.id !== "commandInput") return null;
@@ -963,6 +1176,7 @@ function renderCurrentView(editorFocus = captureEditorFocus()) {
     mainContent.innerHTML = renderers[activeView]();
   }
   bindDynamicEvents();
+  renderTunerDock();
   refreshIcons();
   restoreEditorFocus(editorFocus);
 }
@@ -987,16 +1201,20 @@ async function refreshState({ quiet = false } = {}) {
   if (!quiet) loading = true;
   if (!quiet) renderCurrentView();
   try {
-    const [state, health, ledger, configuration] = await Promise.all([
+    const [state, health, ledger, configuration, email, governance] = await Promise.all([
       api("/api/organization/state"),
       api("/api/health"),
       api("/api/organization/events"),
       api("/api/configuration"),
+      api("/api/channels/email"),
+      api("/api/governance/status"),
     ]);
     organizationState = state;
     healthState = health;
     ledgerEvents = ledger.events || [];
     configurationState = configuration;
+    emailState = email;
+    governanceState = governance;
     if (!selectedMissionId && state.missions?.length) selectedMissionId = state.missions[0].id;
     systemState.classList.remove("offline");
     systemState.innerHTML = '<span class="system-state-dot" aria-hidden="true"></span>组织在线';
@@ -1010,6 +1228,36 @@ async function refreshState({ quiet = false } = {}) {
   } finally {
     loading = false;
     renderCurrentView(editorFocus);
+  }
+}
+
+async function submitTunerCommand(event) {
+  event.preventDefault();
+  if (tunerInFlight) return;
+  const content = tunerInput.value.trim();
+  if (!content) return;
+  const mission = activeMission();
+  tunerInFlight = true;
+  renderTunerDock();
+  try {
+    const payload = await api("/api/organization/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        content,
+        missionId: mission?.id || null,
+        channel: "tuner-chat",
+      }),
+    });
+    if (payload.mission?.id) selectedMissionId = payload.mission.id;
+    tunerInput.value = "";
+    await refreshState({ quiet: true });
+  } catch (error) {
+    if (error.missionId) selectedMissionId = error.missionId;
+    showToast(error.message, "danger");
+    await refreshState({ quiet: true });
+  } finally {
+    tunerInFlight = false;
+    renderCurrentView();
   }
 }
 
@@ -1035,7 +1283,7 @@ async function submitCommand(event) {
       create_mission: "Mission 已建立，需求明确岗开始工作",
       add_requirement_message: "补充已交给需求明确岗",
       set_workflow_profile: "工作流档位已更新",
-      confirm_baseline: "需求基线已确认，总管 AGENT 开始组织规划",
+      confirm_baseline: "需求基线已确认，群星的调律者开始组织规划",
       retry_blocked: "已启动有限恢复",
       start_heavy_review: "重度全量回顾已启动",
       query_status: "任务状态已刷新",
@@ -1085,7 +1333,7 @@ async function missionAction(action) {
   try {
     if (action === "confirm-baseline") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/confirm-baseline`, { method: "POST" });
-      showToast("需求基线已确认，总管 AGENT 开始组织规划");
+      showToast("需求基线已确认，群星的调律者开始组织规划");
     } else if (action === "retry") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/retry`, { method: "POST" });
       showToast("已在恢复预算内重新任职");
@@ -1175,18 +1423,55 @@ function closeMobileNav() {
   mobileBackdrop.classList.remove("visible");
 }
 
+function tunerIsOpen() {
+  return tunerLayoutQuery.matches
+    ? tunerDock.classList.contains("open")
+    : !appShell.classList.contains("tuner-collapsed");
+}
+
+function setTunerOpen(open) {
+  const mobile = tunerLayoutQuery.matches;
+  if (mobile) {
+    tunerDock.classList.toggle("open", open);
+    tunerBackdrop.classList.toggle("visible", open);
+  } else {
+    appShell.classList.toggle("tuner-collapsed", !open);
+  }
+  document.getElementById("tunerToggleButton").setAttribute("aria-expanded", String(open));
+}
+
+function handleViewportChange() {
+  tunerDock.classList.remove("open");
+  tunerBackdrop.classList.remove("visible");
+  appShell.classList.remove("tuner-collapsed");
+  document.getElementById("tunerToggleButton").setAttribute(
+    "aria-expanded",
+    String(!tunerLayoutQuery.matches),
+  );
+}
+
 document.getElementById("mobileMenuButton").addEventListener("click", openMobileNav);
 document.getElementById("mobileBackdrop").addEventListener("click", closeMobileNav);
 document.getElementById("refreshButton").addEventListener("pointerdown", captureEditorFocus);
 document.getElementById("refreshButton").addEventListener("click", () => refreshState());
+document.getElementById("tunerToggleButton").addEventListener("click", () => setTunerOpen(!tunerIsOpen()));
+document.getElementById("tunerCloseButton").addEventListener("click", () => setTunerOpen(false));
+document.getElementById("emailSettingsButton").addEventListener("click", openEmailConfigDialog);
+document.getElementById("tunerForm").addEventListener("submit", submitTunerCommand);
+document.getElementById("tunerBackdrop").addEventListener("click", () => setTunerOpen(false));
+tunerLayoutQuery.addEventListener("change", handleViewportChange);
 detailDialog.addEventListener("click", (event) => {
   if (event.target === detailDialog) detailDialog.close();
 });
 
+handleViewportChange();
 refreshState();
 pollTimer = setInterval(() => {
   const hasActiveRun = Boolean(organizationState?.activeRunIds?.length);
-  if (hasActiveRun && !requestInFlight) refreshState({ quiet: true });
-}, 2500);
+  const emailEnabled = emailState?.enabled === true;
+  if ((hasActiveRun || emailEnabled) && !requestInFlight && !tunerInFlight && !emailRequestInFlight) {
+    refreshState({ quiet: true });
+  }
+}, 3500);
 
 window.addEventListener("beforeunload", () => clearInterval(pollTimer));

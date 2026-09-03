@@ -25,7 +25,7 @@ async function askAdapter(interface_) {
   while (true) {
     const value = (await ask(
       interface_,
-      "总管适配器 (codex/cursor/zcode/grok/custom)",
+      "群星的调律者适配器 (codex/cursor/zcode/grok/custom)",
       "codex",
     )).toLowerCase();
     if (allowed.has(value)) return value;

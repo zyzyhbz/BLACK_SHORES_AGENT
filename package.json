@@ -1,12 +1,18 @@
 {
   "name": "black-shores-agent",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Local-first organizational runtime for the BLACK_SHORES_AGENT MVP",
   "scripts": {
     "setup": "node setup.js",
     "start": "node server.js",
-    "test": "node --test organization-core.test.js server.test.js"
+    "test": "node --test organization-core.test.js runtime-governance.test.js email-bridge.test.js server.test.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "imapflow": "^1.0.195",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^7.0.6"
   },
   "engines": {
     "node": ">=18"
