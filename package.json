@@ -1,6 +1,6 @@
 {
   "name": "black-shores-agent",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "Local-first organizational runtime for the BLACK_SHORES_AGENT MVP",
   "scripts": {

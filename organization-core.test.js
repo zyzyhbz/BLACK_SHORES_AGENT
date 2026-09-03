@@ -617,6 +617,68 @@ test("natural-language command bus records commands and controls workflow profil
   assert.equal(ledger.events().filter((event) => event.type === "command.executed").length, 2);
 });
 
+test("global tuner context stays independent from a blocked Mission", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => {
+      throw new Error("model unavailable");
+    },
+  });
+
+  const blockedMission = service.createMission("调查一个会阻塞的旧任务并保留现场");
+  assert.throws(
+    () => service.executeCommand({
+      content: "在旧任务仍运行时启动另一个目标",
+      channel: "tuner-chat",
+      context: "global",
+    }),
+    (error) => {
+      assert.equal(error.statusCode, 409);
+      assert.equal(error.missionId, blockedMission.id);
+      assert.match(error.message, new RegExp(blockedMission.id));
+      return true;
+    },
+  );
+  await settle(service);
+  assert.equal(service.mission(blockedMission.id).status, "blocked");
+
+  const globalStatus = service.executeCommand({
+    content: "查看当前任务状态",
+    channel: "tuner-chat",
+    context: "global",
+  });
+  assert.equal(globalStatus.action, "query_organization_status");
+  assert.equal(globalStatus.mission, null);
+  assert.match(globalStatus.reply, /1 个 Mission.*1 个阻塞/);
+
+  const missionStatus = service.executeCommand({
+    content: "查看当前任务状态",
+    missionId: blockedMission.id,
+    channel: "local-workbench",
+  });
+  assert.equal(missionStatus.action, "query_status");
+  assert.equal(missionStatus.mission.id, blockedMission.id);
+  assert.equal(missionStatus.mission.status, "blocked");
+
+  const newMission = service.executeCommand({
+    content: "处理一个与旧阻塞任务无关的新目标",
+    channel: "tuner-chat",
+    context: "global",
+  });
+  assert.equal(newMission.action, "create_mission");
+  assert.notEqual(newMission.mission.id, blockedMission.id);
+  assert.equal(service.state().missions.length, 2);
+  await settle(service);
+
+  const tunerRequests = ledger.events().filter(
+    (event) => event.type === "command.requested" && event.payload.channel === "tuner-chat",
+  );
+  assert.ok(tunerRequests.every((event) => event.payload.context === "global"));
+  assert.ok(tunerRequests.every((event) => event.missionId === null));
+});
+
 test("auto workflow profile explains deterministic light and heavy selections", async () => {
   const first = tempLedger();
   const lightService = new OrganizationService({ ledger: first.ledger, project: project(first.directory), runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }) });

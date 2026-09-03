@@ -133,6 +133,15 @@ test("HTTP surface serves the workbench and rejects invalid mission input", asyn
   });
   assert.equal(commandResponse.status, 202);
   assert.equal((await commandResponse.json()).action, "query_status");
+  const globalCommandResponse = await fetch(`${server.origin}/api/organization/commands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "查看当前任务状态", channel: "tuner-chat", context: "global" }),
+  });
+  assert.equal(globalCommandResponse.status, 202);
+  const globalCommand = await globalCommandResponse.json();
+  assert.equal(globalCommand.action, "query_organization_status");
+  assert.equal(globalCommand.mission, null);
   const serverSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
   assert.doesNotMatch(serverSource, /组织 Run 超过.*分钟/);
   assert.doesNotMatch(serverSource, /timeoutMs\s*=\s*45\s*\*/);

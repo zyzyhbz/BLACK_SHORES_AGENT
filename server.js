@@ -1749,6 +1749,7 @@ const server = http.createServer(async (request, response) => {
         content: payload.content,
         missionId: payload.missionId || null,
         channel: payload.channel || "tuner-chat",
+        context: payload.context || "automatic",
       }));
     } catch (error) {
       organizationError(response, error);

@@ -247,19 +247,20 @@ function renderMessage(message) {
 }
 
 function commandConversation() {
-  const missionId = activeMission()?.id;
+  const globalTunerCommandIds = new Set(
+    ledgerEvents
+      .filter((event) => event.type === "command.requested"
+        && event.payload.channel === "tuner-chat"
+        && event.payload.context === "global")
+      .map((event) => event.payload.id),
+  );
   return ledgerEvents
-    .filter((event) => {
-      if (["command.requested", "command.executed", "command.rejected"].includes(event.type)) return true;
-      return event.type === "message.recorded"
-        && event.missionId === missionId
-        && event.payload.authorType === "role";
-    })
+    .filter((event) => ["command.requested", "command.executed", "command.rejected"].includes(event.type))
+    .filter((event) => globalTunerCommandIds.has(event.payload.id) || globalTunerCommandIds.has(event.causationId))
     .slice(-40);
 }
 
 function renderTunerDock() {
-  const mission = activeMission();
   const status = document.getElementById("tunerStatus");
   const context = document.getElementById("tunerContext");
   const governance = document.getElementById("tunerGovernance");
@@ -275,19 +276,11 @@ function renderTunerDock() {
       : "等待配置可用 AGENT";
   }
   if (context) {
-    context.innerHTML = mission
-      ? `<span>当前 Mission</span><strong>${escapeHtml(mission.title)}</strong>${statusPill(mission.status)}`
-      : `<span>当前上下文</span><strong>新目标</strong><small>命令将建立新的 Mission</small>`;
+    context.innerHTML = `<span>独立上下文</span><strong>组织全局</strong><small>不自动绑定页面 Mission</small>`;
   }
   if (tunerMessages) {
     tunerMessages.innerHTML = conversation.length
       ? conversation.map((event) => {
-          if (event.type === "message.recorded") {
-            const questions = Array.isArray(event.payload.questions) && event.payload.questions.length
-              ? `<div class="tuner-questions">${event.payload.questions.map((item, index) => `<span><b>${index + 1}</b>${escapeHtml(item.question || item)}</span>`).join("")}</div>`
-              : "";
-            return `<article class="tuner-message tuner-message-agent"><header><span>${escapeHtml(event.payload.roleName || "组织角色")}</span><time>${formatTime(event.at)}</time></header><p>${escapeHtml(event.payload.content || "角色已返回结果").replaceAll("\n", "<br />")}</p>${questions}</article>`;
-          }
           if (event.type === "command.requested") {
             const channel = event.payload.channel === "email" ? "邮箱" : "软件";
             return `<article class="tuner-message tuner-message-human"><header><span>你 · ${channel}</span><time>${formatTime(event.at)}</time></header><p>${escapeHtml(event.payload.content).replaceAll("\n", "<br />")}</p></article>`;
@@ -1236,7 +1229,6 @@ async function submitTunerCommand(event) {
   if (tunerInFlight) return;
   const content = tunerInput.value.trim();
   if (!content) return;
-  const mission = activeMission();
   tunerInFlight = true;
   renderTunerDock();
   try {
@@ -1244,15 +1236,14 @@ async function submitTunerCommand(event) {
       method: "POST",
       body: JSON.stringify({
         content,
-        missionId: mission?.id || null,
         channel: "tuner-chat",
+        context: "global",
       }),
     });
     if (payload.mission?.id) selectedMissionId = payload.mission.id;
     tunerInput.value = "";
     await refreshState({ quiet: true });
   } catch (error) {
-    if (error.missionId) selectedMissionId = error.missionId;
     showToast(error.message, "danger");
     await refreshState({ quiet: true });
   } finally {

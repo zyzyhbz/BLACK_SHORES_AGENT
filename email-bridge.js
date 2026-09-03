@@ -246,7 +246,12 @@ class EmailBridge {
     }
     const missionId = missionIdFromSubject(subject);
     try {
-      const result = this.organization.executeCommand({ content, missionId, channel: "email" });
+      const result = this.organization.executeCommand({
+        content,
+        missionId,
+        channel: "email",
+        context: missionId ? "automatic" : "global",
+      });
       this.runtime.lastReceivedAt = new Date().toISOString();
       this.ledger.append("email.command_received", {
         missionId: result.mission?.id || missionId,

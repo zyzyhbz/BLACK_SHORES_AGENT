@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
 
-const SYSTEM_VERSION = "0.7.0-mvp";
+const SYSTEM_VERSION = "0.7.1-mvp";
 const PROJECT_ID = "project-default";
 const MANAGER_MODEL = "configured-model";
 const MANAGER_REASONING = "model-default";
@@ -153,7 +153,17 @@ function normalizeText(value, maxLength = 20_000) {
   return value.replace(/\0/g, "").trim().slice(0, maxLength);
 }
 
-function commandReply(action, mission) {
+function organizationStatusReply(missions) {
+  if (!missions.length) return "当前没有 Mission。可以直接下达新的结果目标。";
+  const running = missions.filter((mission) => !TERMINAL_STATUSES.has(mission.status) && !["blocked", "waiting"].includes(mission.status));
+  const blocked = missions.filter((mission) => mission.status === "blocked");
+  const waiting = missions.filter((mission) => mission.status === "waiting");
+  const latest = missions.slice().sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))[0];
+  return `组织共有 ${missions.length} 个 Mission：${running.length} 个进行中，${blocked.length} 个阻塞，${waiting.length} 个等待；最近更新“${latest.title}”，状态为 ${latest.status}。`;
+}
+
+function commandReply(action, mission, missions = []) {
+  if (action === "query_organization_status") return organizationStatusReply(missions);
   if (action === "query_status") {
     return mission
       ? `${mission.title}：${mission.status}。${mission.statusReason || "状态已刷新。"}`
@@ -737,9 +747,9 @@ class OrganizationService {
         { statusCode: 503 },
       );
     }
-    const active = this.state().missions.find((mission) => !TERMINAL_STATUSES.has(mission.status));
-    if (active) {
-      throw Object.assign(new Error(`MVP 同时只运行一个 Mission：${active.id}`), { statusCode: 409, missionId: active.id });
+    const activeMissionId = this.activeRuns.keys().next().value;
+    if (activeMissionId) {
+      throw Object.assign(new Error(`当前有角色正在执行，完成或安全暂停后才能启动新 Mission：${activeMissionId}`), { statusCode: 409, missionId: activeMissionId });
     }
     const missionId = makeId("mission");
     const profile = resolveWorkflowProfile(workflowProfile, normalizedGoal);
@@ -793,21 +803,24 @@ class OrganizationService {
     return this.mission(missionId);
   }
 
-  executeCommand({ content, missionId = null, channel = "local-workbench" }) {
+  executeCommand({ content, missionId = null, channel = "local-workbench", context = "automatic" }) {
     const normalized = normalizeText(content, 12_000);
     if (!normalized) throw Object.assign(new Error("命令不能为空"), { statusCode: 400 });
     const commandId = makeId("command");
     const missions = this.state().missions;
     const activeMission = missions.find((mission) => !TERMINAL_STATUSES.has(mission.status)) || null;
     const statusQuery = /^(?:查看|查询|汇报)?(?:当前)?(?:任务|Mission)?状态[？?。\s]*$/i.test(normalized);
+    const contextMode = context === "global" ? "global" : "automatic";
     const selectedMission = missionId
       ? this._requireMission(missionId)
-      : activeMission || (statusQuery ? missions[0] || null : null);
+      : contextMode === "global"
+        ? null
+        : activeMission || (statusQuery ? missions[0] || null : null);
     const normalizedChannel = normalizeText(channel, 80) || "local-workbench";
     this.ledger.append("command.requested", {
       missionId: selectedMission?.id || null,
       actorRoleId: "human-owner",
-      payload: { id: commandId, channel: normalizedChannel, content: normalized },
+      payload: { id: commandId, channel: normalizedChannel, context: contextMode, content: normalized },
     });
     try {
       let action;
@@ -836,7 +849,9 @@ class OrganizationService {
         action = "retry_blocked";
       } else if (statusQuery) {
         mission = selectedMission;
-        action = "query_status";
+        action = contextMode === "global" && !selectedMission
+          ? "query_organization_status"
+          : "query_status";
       } else if (!selectedMission || /^(?:新建|创建|开始)(?:一个)?(?:任务|Mission)[:：\s]/i.test(normalized)) {
         mission = this.createMission(normalized);
         action = "create_mission";
@@ -846,12 +861,12 @@ class OrganizationService {
       } else {
         throw Object.assign(new Error(`当前状态 ${selectedMission.status} 无法解释这条命令，请明确说明要查询状态、切换模式或执行门禁动作`), { statusCode: 409 });
       }
-      const reply = commandReply(action, mission);
+      const reply = commandReply(action, mission, this.state().missions);
       this.ledger.append("command.executed", {
         missionId: mission?.id || selectedMission?.id || null,
         actorRoleId: "chief-manager",
         causationId: commandId,
-        payload: { id: commandId, action, status: mission?.status || null, reply, channel: normalizedChannel },
+        payload: { id: commandId, action, status: mission?.status || null, reply, channel: normalizedChannel, context: contextMode },
       });
       return { commandId, action, reply, mission: mission ? publicMission(mission) : null };
     } catch (error) {
@@ -859,7 +874,7 @@ class OrganizationService {
         missionId: selectedMission?.id || null,
         actorRoleId: "chief-manager",
         causationId: commandId,
-        payload: { id: commandId, error: normalizeText(error.message || String(error), 4000) },
+        payload: { id: commandId, error: normalizeText(error.message || String(error), 4000), channel: normalizedChannel, context: contextMode },
       });
       throw error;
     }

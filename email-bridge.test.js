@@ -91,11 +91,28 @@ test("email replies become commands on the original Mission and receive an ackno
     content: "确认需求基线",
     missionId: "mission-77",
     channel: "email",
+    context: "automatic",
   });
   assert.match(sent[0].text, /已接收命令/);
   assert.equal(ledger.events().some((event) => event.type === "email.command_received"), true);
   assert.equal(missionIdFromSubject(parsed.subject), "mission-77");
   assert.equal(commandTextFromEmail(parsed), "确认需求基线");
+});
+
+test("email without a Mission marker enters the global context", async () => {
+  const { bridge, commands } = fixture();
+  await bridge.acceptParsedMessage({
+    from: { value: [{ address: "owner@example.com" }] },
+    subject: "新的组织命令",
+    messageId: "incoming-global-1",
+    text: "查看当前任务状态",
+  });
+  assert.deepEqual(commands[0], {
+    content: "查看当前任务状态",
+    missionId: null,
+    channel: "email",
+    context: "global",
+  });
 });
 
 test("unknown senders cannot issue commands", async () => {
