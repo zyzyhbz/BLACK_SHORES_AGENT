@@ -1,6 +1,12 @@
 const navItems = [
   { id: "workbench", label: "人类工作台", icon: "messages-square" },
   { id: "missions", label: "Mission", icon: "list-tree" },
+  { id: "decisions", label: "决策收件箱", icon: "inbox" },
+  { id: "blockers", label: "阻塞与恢复", icon: "life-buoy" },
+  { id: "quality", label: "质量与发布", icon: "shield-check" },
+  { id: "cognition", label: "认知与决策", icon: "brain" },
+  { id: "evolution", label: "演进实验室", icon: "flask-conical" },
+  { id: "knowledge", label: "信息与技能", icon: "library" },
   { id: "organization", label: "组织与角色", icon: "network" },
   { id: "ledger", label: "证据账本", icon: "scroll-text" },
   { id: "resources", label: "AGENT 资源", icon: "cpu" },
@@ -9,6 +15,12 @@ const navItems = [
 const pageMeta = {
   workbench: ["组织入口", "人类工作台"],
   missions: ["业务结果", "Mission"],
+  decisions: ["待你处理", "决策收件箱"],
+  blockers: ["等待与恢复", "阻塞与恢复"],
+  quality: ["验证与门禁", "质量与发布"],
+  cognition: ["发散与审议", "认知与决策"],
+  evolution: ["观察与改进", "演进实验室"],
+  knowledge: ["检索与技能", "信息与技能"],
   organization: ["责任结构", "组织与角色"],
   ledger: ["统一事实源", "证据账本"],
   resources: ["诊断入口", "AGENT 资源"],
@@ -28,7 +40,7 @@ const statusMeta = {
   awaiting_external_evidence: ["待外部证据", "decision"],
   awaiting_result_acceptance: ["待结果验收", "decision"],
   blocked: ["已阻塞", "danger"],
-  waiting: ["外部等待", "waiting"],
+  waiting: ["已安全暂停", "waiting"],
   accepted: ["已验收", "success"],
   failed: ["已失败", "danger"],
   cancelled: ["已取消", "neutral"],
@@ -42,6 +54,7 @@ let configurationState = null;
 let emailState = null;
 let governanceState = null;
 let ledgerEvents = [];
+let inspectionState = null;
 let loading = true;
 let requestInFlight = false;
 let tunerInFlight = false;
@@ -138,13 +151,22 @@ function updateAppIdentity() {
 
 function renderNav() {
   const missionCount = organizationState?.missions?.length || 0;
+  const openDecisions = (organizationState?.missions || []).reduce(
+    (count, mission) => count + (mission.decisions || []).filter((item) => item.status === "open").length,
+    0,
+  );
+  const openBlockers = (organizationState?.missions || []).reduce(
+    (count, mission) => count + (mission.blockers || []).filter((item) => item.status === "open").length,
+    0,
+  );
+  const badges = { missions: missionCount, decisions: openDecisions, blockers: openBlockers };
   navList.innerHTML = navItems
     .map(
       (item) => `
         <button type="button" class="nav-button ${activeView === item.id ? "active" : ""}" data-view="${item.id}">
           ${icon(item.icon)}
           <span>${item.label}</span>
-          ${item.id === "missions" && missionCount ? `<small>${missionCount}</small>` : ""}
+          ${badges[item.id] ? `<small>${badges[item.id]}</small>` : ""}
         </button>`,
     )
     .join("");
@@ -163,26 +185,11 @@ function commandKey(mission = activeMission()) {
   return mission?.id || "new";
 }
 
-function missionProgress(status) {
-  const order = [
-    "intake",
-    "clarifying",
-    "awaiting_baseline_confirmation",
-    "planning",
-    "executing",
-    "awaiting_review",
-    "testing",
-    "light_completed",
-    "release_candidate_ready",
-    "awaiting_release_approval",
-    "awaiting_external_evidence",
-    "awaiting_result_acceptance",
-    "accepted",
-  ];
-  if (status === "light_completed") return 100;
-  if (status === "blocked" || status === "waiting") return 42;
-  const index = Math.max(0, order.indexOf(status));
-  return Math.round((index / (order.length - 1)) * 100);
+function workItemProgress(mission) {
+  const items = mission?.workItems || [];
+  if (!items.length) return null;
+  const done = items.filter((item) => ["completed", "superseded"].includes(item.status)).length;
+  return { done, total: items.length };
 }
 
 function renderEmptyWorkbench() {
@@ -351,7 +358,7 @@ function renderBaseline(mission) {
       </div>
       <div class="decision-actions">
         <button type="button" class="button button-secondary" data-action="request-baseline-change">补充或修正</button>
-        <button type="button" class="button button-primary" data-action="confirm-baseline" ${requestInFlight ? "disabled" : ""}>
+        <button type="button" class="button button-primary" data-action="confirm-baseline" ${requestInFlight || !missionActionAvailable(mission, "confirm-baseline") ? "disabled" : ""}>
           ${icon("check")}
           <span>确认需求基线</span>
         </button>
@@ -370,8 +377,10 @@ function renderResponseComposer(mission) {
   const placeholder = ["clarifying", "awaiting_baseline_confirmation"].includes(mission.status)
     ? "回答需求明确岗，或输入“使用轻度模式”“确认需求基线”。"
     : mission.status === "blocked"
-      ? "输入“恢复任务”或查询当前状态。"
-      : "输入命令，例如“查看当前任务状态”或“开始重度全量回顾”。";
+      ? "描述要修改的需求，或点击上方“恢复任务”。"
+      : mission.status === "waiting"
+        ? "输入中途修改要求，或点击上方“继续运行”。"
+        : "输入命令，例如“查看当前任务状态”或“开始重度全量回顾”。";
   return `${blockerBar}
     <form class="response-composer command-composer" id="commandForm">
       <label for="commandInput">命令总线 · ${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</label>
@@ -387,6 +396,10 @@ function candidateApproval(mission, kind) {
       approval.candidateId === mission.releaseCandidate?.id &&
       approval.candidateDigest === mission.releaseCandidate?.digest,
   );
+}
+
+function missionActionAvailable(mission, action) {
+  return Array.isArray(mission?.availableActions) && mission.availableActions.includes(action);
 }
 
 function shortCommit(value) {
@@ -406,35 +419,35 @@ function renderReleaseGate(mission) {
     action = `
       <div class="gate-action">
         <div><strong>核对候选来源</strong><small>系统将同步远端并校验分支、提交、工作树与项目配置指纹。</small></div>
-        <button type="button" class="button button-primary" data-action="verify-source" ${requestInFlight ? "disabled" : ""}>${icon("scan-search")}核对来源</button>
+        <button type="button" class="button button-primary" data-action="verify-source" ${requestInFlight || !missionActionAvailable(mission, "verify-source") ? "disabled" : ""}>${icon("scan-search")}核对来源</button>
       </div>`;
   } else if (mission.status === "awaiting_release_approval" && !mergeApproval) {
     action = `
       <div class="gate-action gate-warning">
         <div><strong>合并授权</strong><small>只授权合并当前指纹候选，不包含部署。</small></div>
-        <button type="button" class="button button-primary" data-action="approve-merge" ${requestInFlight ? "disabled" : ""}>${icon("git-merge")}批准合并</button>
+        <button type="button" class="button button-primary" data-action="approve-merge" ${requestInFlight || !missionActionAvailable(mission, "approve-merge") ? "disabled" : ""}>${icon("git-merge")}批准合并</button>
       </div>`;
   } else if (mission.status === "awaiting_release_approval" && !deploymentApproval) {
     action = `
       <div class="gate-action gate-warning">
         <div><strong>部署授权</strong><small>合并授权已记录；本动作只授权部署当前候选。</small></div>
-        <button type="button" class="button button-primary" data-action="approve-deployment" ${requestInFlight ? "disabled" : ""}>${icon("upload-cloud")}批准部署</button>
+        <button type="button" class="button button-primary" data-action="approve-deployment" ${requestInFlight || !missionActionAvailable(mission, "approve-deployment") ? "disabled" : ""}>${icon("upload-cloud")}批准部署</button>
       </div>`;
   } else if (mission.status === "awaiting_external_evidence") {
     action = `
-      <form class="external-evidence-form" id="externalEvidenceForm">
+      <form class="external-evidence-form" id="externalEvidenceForm" aria-disabled="${!missionActionAvailable(mission, "external-evidence")}">
         <label for="buildIdentity">候选身份</label>
         <input id="buildIdentity" name="buildIdentity" maxlength="500" placeholder="版本号、部署时间或构建 ID" required />
         <fieldset class="result-segment"><legend>外部验收结果</legend><label><input type="radio" name="result" value="passed" required /><span>${icon("check")}通过</span></label><label><input type="radio" name="result" value="failed" required /><span>${icon("x")}失败</span></label></fieldset>
         <label for="externalNotes">证据摘要</label>
         <textarea id="externalNotes" name="notes" rows="3" maxlength="6000" placeholder="环境、步骤、观察结果与证据路径"></textarea>
-        <button type="submit" class="button button-primary" ${requestInFlight ? "disabled" : ""}>${icon("clipboard-check")}提交外部证据</button>
+        <button type="submit" class="button button-primary" ${requestInFlight || !missionActionAvailable(mission, "external-evidence") ? "disabled" : ""}>${icon("clipboard-check")}提交外部证据</button>
       </form>`;
   } else if (mission.status === "awaiting_result_acceptance") {
     action = `
       <div class="gate-action gate-success">
         <div><strong>业务结果验收</strong><small>${escapeHtml(latestExternalEvidence?.buildIdentity || "当前候选")} 的外部证据已通过。</small></div>
-        <button type="button" class="button button-primary" data-action="accept-result" ${requestInFlight ? "disabled" : ""}>${icon("badge-check")}验收结果</button>
+        <button type="button" class="button button-primary" data-action="accept-result" ${requestInFlight || !missionActionAvailable(mission, "accept-result") ? "disabled" : ""}>${icon("badge-check")}验收结果</button>
       </div>`;
   } else if (mission.status === "accepted") {
     action = `<div class="gate-action gate-success"><div><strong>Mission 已验收</strong><small>发布授权、外部证据和结果验收均已独立留痕。</small></div>${icon("badge-check")}</div>`;
@@ -479,24 +492,86 @@ function renderWorkItems(mission) {
 }
 
 function renderRun(run) {
+  const runIcon = run.status === "running"
+    ? "loader-circle"
+    : run.status === "completed"
+      ? "check"
+      : run.status === "paused"
+        ? "pause"
+        : "x";
   const activity = run.status === "running"
     ? run.currentAction || run.lastCheckpoint?.summary || "角色正在执行"
     : `${run.invocations?.length || 1} 次物理调用`;
   return `
     <div class="run-row">
-      <span class="run-icon">${icon(run.status === "running" ? "loader-circle" : run.status === "completed" ? "check" : "x", run.status === "running" ? "spin" : "")}</span>
+      <span class="run-icon">${icon(runIcon, run.status === "running" ? "spin" : "")}</span>
       <div><strong>${escapeHtml(run.roleName)}</strong><small>${escapeHtml(activity)} · ${formatTime(run.lastHeartbeatAt || run.at)}</small></div>
       <span class="run-status">${escapeHtml(run.status)}</span>
     </div>`;
 }
 
+function renderMissionControls(mission) {
+  const active = organizationState?.activeRuns?.find((run) => run.missionId === mission.id);
+  const profileEditable = missionActionAvailable(mission, "workflow-profile");
+  const profile = mission.workflowProfile?.requested || "auto";
+  const profileButtons = [
+    ["auto", "自动"],
+    ["light", "轻度"],
+    ["heavy", "重度"],
+  ].map(([value, label]) => `
+    <button type="button" class="segment-button ${profile === value ? "active" : ""}" data-workflow-profile="${value}" ${!profileEditable || requestInFlight ? "disabled" : ""}>${label}</button>`).join("");
+  const pauseLabel = active?.pauseRequested
+    ? "正在安全暂停"
+    : mission.status === "waiting"
+      ? "已安全暂停"
+      : "安全暂停";
+  const pauseButton = `<button type="button" class="button button-danger" data-action="pause" ${requestInFlight || !missionActionAvailable(mission, "pause") || active?.pauseRequested ? "disabled" : ""}>${icon(active?.pauseRequested ? "loader-circle" : "pause", active?.pauseRequested ? "spin" : "")} ${pauseLabel}</button>`;
+  const stopButton = active && missionActionAvailable(mission, "emergency-stop")
+    ? `<button type="button" class="button button-danger" data-action="emergency-stop" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("octagon-x")}紧急停止</button>`
+    : "";
+  const cancelButton = missionActionAvailable(mission, "cancel")
+    ? `<button type="button" class="button button-secondary" data-action="cancel" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("ban")}取消任务</button>`
+    : "";
+  const overrideButton = missionActionAvailable(mission, "override")
+    ? `<button type="button" class="button button-secondary" data-action="new-override" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("siren")}紧急绕过</button>`
+    : "";
+  const deviceButton = missionActionAvailable(mission, "device-package")
+    ? `<button type="button" class="button button-secondary" data-action="device-package" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("smartphone")}真机执行包</button>`
+    : "";
+  const deviceEvidenceButton = missionActionAvailable(mission, "device-evidence")
+    ? `<button type="button" class="button button-secondary" data-action="device-evidence" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("clipboard-check")}回填真机证据</button>`
+    : "";
+  const qualityButton = missionActionAvailable(mission, "quality-decision")
+    ? `<button type="button" class="button button-secondary" data-action="quality-decision" ${requestInFlight ? "disabled" : ""}>${icon("stamp")}签署质量判定</button>`
+    : "";
+  const waitingButton = missionActionAvailable(mission, "record-waiting")
+    ? `<button type="button" class="button button-secondary" data-action="new-waiting" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("hourglass")}记录等待</button>`
+    : "";
+  let contextualActions = "";
+  if (mission.status === "waiting") {
+    contextualActions = `<button type="button" class="button button-secondary" data-action="request-revision" ${requestInFlight || !missionActionAvailable(mission, "revise-requirements") ? "disabled" : ""}>${icon("pencil-line")}修改需求</button><button type="button" class="button button-primary" data-action="resume" ${requestInFlight || !missionActionAvailable(mission, "resume") ? "disabled" : ""}>${icon("play")}继续运行</button>`;
+  } else if (mission.status === "blocked") {
+    contextualActions = `<button type="button" class="button button-secondary" data-action="request-revision" ${requestInFlight || !missionActionAvailable(mission, "revise-requirements") ? "disabled" : ""}>${icon("pencil-line")}修改需求</button><button type="button" class="button button-primary" data-action="retry" ${requestInFlight || !missionActionAvailable(mission, "retry") ? "disabled" : ""}>${icon("rotate-ccw")}恢复任务</button>`;
+  } else if (mission.status === "light_completed") {
+    contextualActions = `<button type="button" class="button button-primary" data-action="start-heavy-review" ${requestInFlight || !missionActionAvailable(mission, "start-heavy-review") ? "disabled" : ""}>${icon("shield-check")}启动重度全量回顾</button>`;
+  }
+  return `
+    <section class="mission-controls" aria-label="Mission 控制">
+      <div class="workflow-control"><span>工作模式</span><div class="segmented-control" aria-label="工作流模式">${profileButtons}</div><small>${escapeHtml(mission.workflowProfile?.reason || "")}</small></div>
+      <div class="mission-control-actions">${contextualActions}${pauseButton}${stopButton}${cancelButton}${overrideButton}${deviceButton}${deviceEvidenceButton}${qualityButton}${waitingButton}</div>
+    </section>`;
+}
+
 function renderActiveRun(mission) {
   const active = organizationState?.activeRuns?.find((run) => run.missionId === mission.id);
   if (!active) return "";
+  const runRecord = (mission.runs || []).find((run) => run.id === active.runId);
   return `
     <section class="inspector-section activity-section">
-      <header><span>活动 Run</span><span class="live-indicator"><i></i>运行中</span></header>
+      <header><span>活动 Run</span><span class="live-indicator"><i></i>${active.pauseRequested ? "暂停中" : "运行中"}</span></header>
       <div class="activity-line"><span>当前动作</span><strong>${escapeHtml(active.currentAction || "正在建立执行上下文")}</strong></div>
+      <div class="activity-line"><span>角色</span><strong>${escapeHtml(active.roleName || "")}</strong></div>
+      <div class="activity-line"><span>实际模型</span><code>${escapeHtml(runRecord?.model || "—")}${runRecord?.reasoningEffort ? ` · ${escapeHtml(runRecord.reasoningEffort)}` : ""}</code></div>
       <div class="activity-line"><span>物理调用</span><code>${escapeHtml(active.invocationId || "—")}</code></div>
       <div class="activity-line"><span>最后心跳</span><time>${formatTime(active.lastHeartbeatAt)}</time></div>
       <div class="activity-line"><span>最后检查点</span><time>${formatTime(active.lastCheckpointAt)}</time></div>
@@ -504,7 +579,7 @@ function renderActiveRun(mission) {
 }
 
 function renderMissionWorkbench(mission) {
-  const progress = missionProgress(mission.status);
+  const progress = workItemProgress(mission);
   const currentRun = organizationState?.activeRuns?.find((run) => run.missionId === mission.id);
   return `
     <div class="workbench-grid">
@@ -516,7 +591,8 @@ function renderMissionWorkbench(mission) {
           </div>
           <div class="mission-header-state"><span class="workflow-profile">${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</span>${statusPill(mission.status)}</div>
         </header>
-        <div class="mission-progress" aria-label="Mission 进度"><span style="width:${progress}%"></span></div>
+        <div class="mission-progress" aria-label="工作合同完成项">${progress ? `<span>已完成工作项 ${progress.done}/${progress.total}</span>` : `<span>工作合同尚未建立，暂无可计数项</span>`}</div>
+        ${renderMissionControls(mission)}
         <div class="conversation-stream">
           ${mission.messages.map(renderMessage).join("") || '<div class="quiet-empty">尚无消息</div>'}
         </div>
@@ -565,7 +641,7 @@ function renderMissions() {
     <section class="page-section">
       <header class="section-heading">
         <div><span class="section-kicker">业务结果容器</span><h2>Mission</h2></div>
-        <button type="button" class="button button-primary" data-action="new-mission" ${missions.some((item) => !["light_completed", "accepted", "failed", "cancelled", "superseded"].includes(item.status)) ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
+        <button type="button" class="button button-primary" data-action="new-mission" ${organizationState?.controls?.canCreateMission === false ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
       </header>
       <div class="mission-table">
         <div class="table-head"><span>Mission</span><span>状态</span><span>责任阶段</span><span>更新时间</span><span></span></div>
@@ -625,6 +701,9 @@ function eventLabel(event) {
     "run.started": "启动 Run",
     "run.completed": "完成 Run",
     "run.failed": "Run 失败",
+    "run.pause_requested": "请求安全暂停",
+    "run.paused": "暂停 Run",
+    "run.resume_requested": "恢复 Run",
     "run.output_rejected": "拒绝不合约输出",
     "run.heartbeat": "记录 Run 心跳",
     "run.checkpointed": "保存进度检查点",
@@ -633,6 +712,7 @@ function eventLabel(event) {
     "physical_invocation.failed": "物理调用失败",
     "physical_invocation.interrupted": "物理调用中断",
     "workflow_profile.selected": "选择工作流档位",
+    "requirements_revision.requested": "记录中途需求修改",
     "baseline.drafted": "生成基线草案",
     "baseline.confirmed": "确认需求基线",
     "charter.created": "建立任务章程",
@@ -824,6 +904,229 @@ function renderResources() {
     </section>`;
 }
 
+function allDecisions() {
+  const out = [];
+  for (const mission of organizationState?.missions || []) {
+    for (const decision of mission.decisions || []) {
+      out.push({ mission, decision });
+    }
+  }
+  return out.sort((left, right) => {
+    const openRank = (item) => (item.decision.status === "open" ? 0 : 1);
+    return openRank(left) - openRank(right)
+      || String(right.decision.requestedAt || "").localeCompare(String(left.decision.requestedAt || ""));
+  });
+}
+
+function decisionCard({ mission, decision }) {
+  const open = decision.status === "open";
+  return `
+    <article class="role-card">
+      <div class="role-card-head">
+        <span>${open ? "待" : "毕"}</span>
+        <div>
+          <strong>${escapeHtml(decision.title)}</strong>
+          <small>${escapeHtml(decision.id)} · ${escapeHtml(mission.title)} · ${escapeHtml(decision.kind || "")} · 紧迫度 ${escapeHtml(decision.urgency || "normal")}</small>
+        </div>
+      </div>
+      <p>${escapeHtml(decision.facts || "暂无背景事实")}</p>
+      ${decision.impacts ? `<p>影响：${escapeHtml(decision.impacts)}</p>` : ""}
+      ${(decision.options || []).length ? `<div class="work-item-list">${decision.options.map((option) => `<div class="work-item"><span>${escapeHtml(option)}</span></div>`).join("")}</div>` : ""}
+      ${decision.recommendation ? `<p>建议：${escapeHtml(decision.recommendation)}</p>` : ""}
+      ${decision.noDecisionConsequence ? `<p>不决策后果：${escapeHtml(decision.noDecisionConsequence)}</p>` : ""}
+      ${decision.objectVersion ? `<div class="role-mode">对象版本 ${escapeHtml(decision.objectVersion)}</div>` : ""}
+      ${open
+        ? `<div class="decision-actions">
+            <button type="button" class="button button-primary" data-action="resolve-decision" data-mission-id="${escapeHtml(mission.id)}" data-decision-id="${escapeHtml(decision.id)}" data-resolution="approved" ${requestInFlight ? "disabled" : ""}>批准</button>
+            <button type="button" class="button button-secondary" data-action="resolve-decision" data-mission-id="${escapeHtml(mission.id)}" data-decision-id="${escapeHtml(decision.id)}" data-resolution="rejected" ${requestInFlight ? "disabled" : ""}>驳回</button>
+            <button type="button" class="button button-secondary" data-action="resolve-decision" data-mission-id="${escapeHtml(mission.id)}" data-decision-id="${escapeHtml(decision.id)}" data-resolution="deferred" ${requestInFlight ? "disabled" : ""}>暂缓</button>
+          </div>`
+        : `<div class="role-mode">已${decision.status === "approved" ? "批准" : decision.status === "rejected" ? "驳回" : "暂缓"}</div>`}
+    </article>`;
+}
+
+function renderDecisions() {
+  const items = allDecisions();
+  const open = items.filter((item) => item.decision.status === "open");
+  return `
+    <section class="page-section">
+      <header class="section-heading">
+        <div><span class="section-kicker">真正需要人类处理</span><h2>决策收件箱${open.length ? `（${open.length} 待处理）` : ""}</h2></div>
+        <button type="button" class="button button-secondary" data-action="new-decision">${icon("plus")}新建决策事项</button>
+      </header>
+      ${items.length ? `<div class="role-grid">${items.map(decisionCard).join("")}</div>` : '<div class="table-empty">暂无决策事项，正常工作不需要你审批。</div>'}
+    </section>`;
+}
+
+function blockerCard(mission, blocker) {
+  return `
+    <article class="role-card">
+      <div class="role-card-head">
+        <span>阻</span>
+        <div>
+          <strong>${escapeHtml(blocker.category || "阻塞")}</strong>
+          <small>${escapeHtml(blocker.id)} · ${escapeHtml(mission.title)} · 已用 ${escapeHtml(blocker.attemptsUsed ?? 0)}/${escapeHtml(blocker.attemptBudget ?? 2)} 次恢复</small>
+        </div>
+      </div>
+      <p>${escapeHtml(blocker.error || "等待诊断")}</p>
+      <div class="role-mode">责任 ${escapeHtml(blocker.ownerRoleId || "blocker-lead")} · 失败角色 ${escapeHtml(blocker.failedRoleId || "—")}</div>
+      <div class="decision-actions">
+        <button type="button" class="button button-primary" data-action="retry" data-mission-id="${escapeHtml(mission.id)}" ${requestInFlight ? "disabled" : ""}>${icon("rotate-ccw")}恢复任务</button>
+      </div>
+    </article>`;
+}
+
+function waitingCard(mission, waiting) {
+  return `
+    <article class="role-card">
+      <div class="role-card-head">
+        <span>等</span>
+        <div>
+          <strong>正常等待</strong>
+          <small>${escapeHtml(waiting.id)} · ${escapeHtml(mission.title)} · 责任 ${escapeHtml(waiting.responsibleRoleId || "")}</small>
+        </div>
+      </div>
+      <p>${escapeHtml(waiting.reason || "")}</p>
+      ${waiting.expectedAt ? `<div class="role-mode">预计 ${escapeHtml(waiting.expectedAt)}</div>` : ""}
+      <div class="decision-actions">
+        <button type="button" class="button button-secondary" data-action="close-waiting" data-mission-id="${escapeHtml(mission.id)}" data-waiting-id="${escapeHtml(waiting.id)}" ${requestInFlight ? "disabled" : ""}>关闭等待</button>
+      </div>
+    </article>`;
+}
+
+function renderBlockers() {
+  const openBlockers = [];
+  const openWaiting = [];
+  for (const mission of organizationState?.missions || []) {
+    for (const blocker of mission.blockers || []) {
+      if (blocker.status === "open") openBlockers.push({ mission, blocker });
+    }
+    for (const waiting of mission.waitingConditions || []) {
+      if (waiting.status === "open") openWaiting.push({ mission, waiting });
+    }
+  }
+  return `
+    <section class="page-section">
+      <header class="section-heading"><div><span class="section-kicker">等待是等待，阻塞是阻塞</span><h2>阻塞与恢复</h2></div><button type="button" class="button button-secondary" data-action="new-waiting">${icon("plus")}记录等待</button></header>
+      ${(inspectionState?.findings || []).length ? `<div class="work-item-list"><div class="assignment-list-title"><strong>巡检发现（${inspectionState.findings.length}）</strong><span>停滞、缺证、逾期等待独立于执行持续检查</span></div>${inspectionState.findings.map((finding) => `<div class="work-item"><span><strong>${escapeHtml(finding.kind)}</strong> ${escapeHtml(finding.detail || "")}</span><small>${escapeHtml(finding.missionId || "")} · ${escapeHtml(finding.level || "")}</small></div>`).join("")}</div>` : ""}
+      <div class="assignment-list-title"><strong>真实阻塞（${openBlockers.length}）</strong><span>需要换路或升级，不会自动消失</span></div>
+      ${openBlockers.length ? `<div class="role-grid">${openBlockers.map(({ mission, blocker }) => blockerCard(mission, blocker)).join("")}</div>` : '<div class="table-empty">无开放阻塞。</div>'}
+      <div class="assignment-list-title"><strong>正常等待（${openWaiting.length}）</strong><span>不消耗模型调用，条件满足即关闭</span></div>
+      ${openWaiting.length ? `<div class="role-grid">${openWaiting.map(({ mission, waiting }) => waitingCard(mission, waiting)).join("")}</div>` : '<div class="table-empty">无正常等待。</div>'}
+    </section>`;
+}
+
+function simpleList(title, items, renderItem) {
+  return `
+    <section class="inspector-section">
+      <header><span>${escapeHtml(title)}</span><small>${items.length}</small></header>
+      ${items.length ? `<div class="work-item-list">${items.map(renderItem).join("")}</div>` : '<div class="quiet-empty">暂无</div>'}
+    </section>`;
+}
+
+function renderQuality() {
+  const missions = organizationState?.missions || [];
+  const gapCases = missions.flatMap((mission) => (mission.gapCases || []).map((gap) => ({ mission, gap })));
+  const baselines = missions.flatMap((mission) => (mission.verifiedBaselines || []).map((baseline) => ({ mission, baseline })));
+  const reviews = missions.flatMap((mission) => (mission.reviews || []).map((review) => ({ mission, review })));
+  const testRuns = missions.flatMap((mission) => (mission.testRuns || []).map((run) => ({ mission, run })));
+  const changes = missions.flatMap((mission) => (mission.changeRecords || []).map((record) => ({ mission, record })));
+  const overrides = missions.flatMap((mission) => (mission.overrides || []).map((override) => ({ mission, override })));
+  const debts = missions.flatMap((mission) => (mission.riskDebts || []).map((debt) => ({ mission, debt })));
+  const packages = missions.flatMap((mission) => (mission.externalEvidencePackages || []).map((devicePackage) => ({ mission, devicePackage })));
+  const roleActions = (ledgerEvents || []).filter((event) => event.type === "role_action.recorded").slice(-20).reverse();
+  const manifests = organizationState?.projectTestManifests || [];
+  return `
+    <section class="page-section">
+      <header class="section-heading">
+        <div><span class="section-kicker">证据先于状态 · 三权分离</span><h2>质量与发布</h2></div>
+        <div class="section-actions">
+          <button type="button" class="button button-secondary" data-action="new-manifest">${icon("plus")}发布测试集</button>
+          <button type="button" class="button button-secondary" data-action="new-override">${icon("siren")}紧急绕过</button>
+        </div>
+      </header>
+      <div class="workbench-grid">
+        <section class="conversation-column">
+          ${simpleList("开放 GapCase", gapCases, ({ mission, gap }) => `<div class="work-item"><span><strong>${escapeHtml(gap.id)}</strong> ${escapeHtml(mission.title)}</span><small>${escapeHtml(gap.status)} · ${escapeHtml(gap.at || "")}</small></div>`)}
+          ${simpleList("VerifiedBaseline", baselines, ({ mission, baseline }) => `<div class="work-item"><span><strong>${escapeHtml(baseline.id || "")}</strong> ${escapeHtml(mission.title)}</span><small>候选 ${escapeHtml(baseline.candidateIdentity || "")}</small></div>`)}
+          ${simpleList("独立复核", reviews, ({ mission, review }) => `<div class="work-item"><span><strong>${escapeHtml(review.verdict || "")}</strong> ${escapeHtml(mission.title)}</span><small>${escapeHtml(review.at || "")}</small></div>`)}
+          ${simpleList("测试运行", testRuns, ({ mission, run }) => `<div class="work-item"><span><strong>${escapeHtml(run.verdict || "")}</strong> ${escapeHtml(mission.title)}</span><small>清单 ${escapeHtml(run.projectTestManifestVersion || "")}</small></div>`)}
+          ${simpleList("轻度 ChangeRecord", changes, ({ mission, record }) => `<div class="work-item"><span><strong>${escapeHtml(record.id || "")}</strong> ${escapeHtml(mission.title)}</span><small>留痕复核通过，非全量验证</small></div>`)}
+        </section>
+        <aside class="mission-inspector">
+          ${simpleList("紧急绕过", overrides, ({ mission, override }) => `<div class="work-item"><span><strong>${escapeHtml(override.id)}</strong> ${escapeHtml((override.overriddenGates || []).join("、"))}</span><small>${escapeHtml(override.status)} · 到期 ${escapeHtml(override.expiresAt || "")}</small></div>`)}
+          ${simpleList("风险债务", debts, ({ mission, debt }) => `<div class="work-item"><span><strong>${escapeHtml(debt.id)}</strong> ${escapeHtml((debt.description || "").slice(0, 40))}</span><small>${escapeHtml(debt.status)}</small></div>`)}
+          ${simpleList("真机执行包", packages, ({ mission, devicePackage }) => `<div class="work-item"><span><strong>${escapeHtml(devicePackage.id)}</strong> ${escapeHtml(devicePackage.buildIdentity || "")}</span><small>${escapeHtml(devicePackage.status)}</small></div>`)}
+          ${simpleList("项目测试集", manifests, (manifest) => `<div class="work-item"><span><strong>${escapeHtml(manifest.id)}</strong> v${escapeHtml(manifest.version)}</span><small>${escapeHtml(manifest.projectId)} · ${manifest.deprecated ? "已废弃" : "生效中"} · ${(manifest.requiredTests || []).length} 必跑项</small></div>`)}
+          <section class="inspector-section">
+            <header><span>动作留痕与撤销</span><small>${roleActions.length}</small></header>
+            <div class="work-item-list">${roleActions.map((event) => `<div class="work-item"><span><strong>${escapeHtml(event.payload?.actionId || event.id)}</strong> ${escapeHtml(event.actorRoleId)}</span><span><small>${escapeHtml(event.payload?.backupArchive ? "有备份" : "无备份")}</small> <button type="button" class="button button-secondary" data-action="revert-action" data-action-id="${escapeHtml(event.payload?.actionId || "")}" ${requestInFlight ? "disabled" : ""}>撤销</button></span></div>`).join("") || '<div class="quiet-empty">暂无</div>'}</div>
+          </section>
+        </aside>
+      </div>
+    </section>`;
+}
+
+function renderCognition() {
+  const missions = organizationState?.missions || [];
+  const cases = missions.flatMap((mission) => (mission.decisionCases || []).map((decisionCase) => ({ mission, decisionCase })));
+  return `
+    <section class="page-section">
+      <header class="section-heading"><div><span class="section-kicker">发散、审议、决定分离</span><h2>认知与决策</h2></div><button type="button" class="button button-secondary" data-action="new-case">${icon("plus")}开启决策事项</button></header>
+      ${cases.length ? cases.map(({ mission, decisionCase }) => `
+        <section class="inspector-section">
+          <header><span>${escapeHtml(decisionCase.title)}</span><small>${escapeHtml(mission.title)} · Owner ${escapeHtml(decisionCase.ownerRoleId || "")} · ${escapeHtml(decisionCase.status)}</small></header>
+          <p>${escapeHtml(decisionCase.context || "")}</p>
+          ${(decisionCase.ideaSets || []).map((idea) => `<div class="work-item-list"><div class="assignment-list-title"><strong>IdeaSet</strong><span>${escapeHtml(idea.id)}</span></div>${(idea.clusters || []).map((cluster) => `<div class="work-item"><span>${escapeHtml(cluster)}</span></div>`).join("")}</div>`).join("")}
+          ${(decisionCase.briefs || []).map((brief) => `<div class="work-item-list"><div class="assignment-list-title"><strong>DecisionBrief · 建议 ${escapeHtml(brief.recommendation || "")}</strong><span>置信度 ${escapeHtml(brief.confidence || "")}</span></div><div class="work-item"><span>候选：${escapeHtml((brief.candidates || []).join(" / "))}</span></div>${(brief.minorityOpinions || []).map((opinion) => `<div class="work-item"><span>少数意见：${escapeHtml(opinion)}</span></div>`).join("")}</div>`).join("")}
+          ${decisionCase.status === "open" ? `<div class="decision-actions">
+            <button type="button" class="button button-secondary" data-action="new-idea" data-mission-id="${escapeHtml(mission.id)}" data-case-id="${escapeHtml(decisionCase.id)}">补创意</button>
+            <button type="button" class="button button-secondary" data-action="new-brief" data-mission-id="${escapeHtml(mission.id)}" data-case-id="${escapeHtml(decisionCase.id)}">写简报</button>
+            <button type="button" class="button button-primary" data-action="decide-case" data-mission-id="${escapeHtml(mission.id)}" data-case-id="${escapeHtml(decisionCase.id)}" data-owner-id="${escapeHtml(decisionCase.ownerRoleId || "")}">正式决定</button>
+          </div>` : `<div class="role-mode">已决定：${escapeHtml(decisionCase.decision || "")}</div>`}
+        </section>`).join("") : '<div class="table-empty">暂无决策事项，重大或开放性需求会自动建议开启。</div>'}
+    </section>`;
+}
+
+function renderEvolution() {
+  const missions = organizationState?.missions || [];
+  const proposals = missions.flatMap((mission) => (mission.evolutionProposals || []).map((proposal) => ({ mission, proposal })));
+  return `
+    <section class="page-section">
+      <header class="section-heading"><div><span class="section-kicker">观察、实验、获批后修改</span><h2>演进实验室</h2></div><button type="button" class="button button-secondary" data-action="new-evolution">${icon("plus")}提交演进提案</button></header>
+      ${proposals.length ? `<div class="role-grid">${proposals.map(({ mission, proposal }) => `
+        <article class="role-card">
+          <div class="role-card-head"><span>进</span><div><strong>${escapeHtml((proposal.problem || "").slice(0, 40))}</strong><small>${escapeHtml(proposal.id)} · ${escapeHtml(mission.title)} · ${escapeHtml(proposal.status)}</small></div></div>
+          <p>假设：${escapeHtml(proposal.hypothesis || "")}</p>
+          <p>回滚：${escapeHtml(proposal.rollback || "未声明")}</p>
+          ${proposal.status === "proposed" ? `<div class="decision-actions">
+            <button type="button" class="button button-primary" data-action="decide-evolution" data-mission-id="${escapeHtml(mission.id)}" data-proposal-id="${escapeHtml(proposal.id)}" data-decision="approved">批准</button>
+            <button type="button" class="button button-secondary" data-action="decide-evolution" data-mission-id="${escapeHtml(mission.id)}" data-proposal-id="${escapeHtml(proposal.id)}" data-decision="rejected">驳回</button>
+          </div>` : ""}
+        </article>`).join("")}</div>` : '<div class="table-empty">暂无演进提案。演进负责人在影子模式观察后会提交有证据的提案。</div>'}
+    </section>`;
+}
+
+function renderKnowledge() {
+  const missions = organizationState?.missions || [];
+  const skills = missions.flatMap((mission) => (mission.skills || []).map((skill) => ({ mission, skill })));
+  const manifests = organizationState?.projectTestManifests || [];
+  const snapshots = organizationState?.assignmentSnapshots || [];
+  return `
+    <section class="page-section">
+      <header class="section-heading"><div><span class="section-kicker">结构、来源、技能</span><h2>信息与技能</h2></div><button type="button" class="button button-secondary" data-action="new-skill">${icon("plus")}登记技能候选</button></header>
+      <div class="workbench-grid">
+        <section class="conversation-column">
+          ${simpleList("技能目录", skills, ({ mission, skill }) => `<div class="work-item"><span><strong>${escapeHtml(skill.name || skill.id)}</strong> ${escapeHtml((skill.description || "").slice(0, 60))}</span><span><small>${escapeHtml(skill.status)}</small> ${skill.status === "candidate" ? `<button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="published">发布</button> <button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="deprecated">废弃</button>` : ""}</span></div>`)}
+          ${simpleList("项目测试集", manifests, (manifest) => `<div class="work-item"><span><strong>${escapeHtml(manifest.id)}</strong> v${escapeHtml(manifest.version)}</span><small>${escapeHtml(manifest.projectId)} · ${manifest.deprecated ? "已废弃" : "生效中"}</small></div>`)}
+        </section>
+        <aside class="mission-inspector">
+          ${simpleList("任职快照", snapshots, (snapshot) => `<div class="work-item"><span><strong>${escapeHtml(snapshot.id || snapshot.payload?.id || "")}</strong></span><small>${escapeHtml(snapshot.at || "")}</small></div>`)}
+        </aside>
+      </div>
+    </section>`;
+}
+
 function renderLoading() {
   return `<div class="loading-state">${icon("loader-circle", "spin")}<span>正在读取本地组织账本</span></div>`;
 }
@@ -963,6 +1266,7 @@ function openAgentConfigDialog() {
         <label class="field-label"><span>输出格式</span><select name="outputFormat"><option value="text">纯文本</option><option value="ndjson">逐行 JSON</option></select></label>
       </div>
       <label class="check-line"><input type="checkbox" name="skipVersionCheck" /><span>跳过 --version 检查</span></label>
+      <div class="probe-line"><button type="button" class="button button-secondary" id="probeAgentButton">探测命令</button><small id="probeAgentResult">先探测，再决定是否接入；接入前会自动保存配置回滚点。</small></div>
       <footer class="dialog-actions"><button type="button" class="button button-secondary" data-close-dialog>取消</button><button type="submit" class="button button-primary">${icon("plug")}接入 AGENT</button></footer>
     </form>`;
   detailDialog.showModal();
@@ -970,7 +1274,28 @@ function openAgentConfigDialog() {
     button.addEventListener("click", () => detailDialog.close());
   });
   document.getElementById("agentConfigForm")?.addEventListener("submit", submitAgentConfig);
+  document.getElementById("probeAgentButton")?.addEventListener("click", probeAgentCommand);
   refreshIcons();
+}
+
+async function probeAgentCommand() {
+  const form = document.getElementById("agentConfigForm");
+  const result = document.getElementById("probeAgentResult");
+  const command = form?.command?.value?.trim();
+  if (!command) {
+    if (result) result.textContent = "请先填写可执行命令。";
+    return;
+  }
+  if (result) result.textContent = "正在探测（只读 --version，不写入任何配置）…";
+  try {
+    const probe = await api("/api/configuration/adapters/probe", {
+      method: "POST",
+      body: JSON.stringify({ command }),
+    });
+    if (result) result.textContent = probe.detected ? `探测到版本：${probe.version}（${probe.durationMs}ms）` : "命令不可用，请检查路径与权限。";
+  } catch (error) {
+    if (result) result.textContent = `探测失败：${error.message}`;
+  }
 }
 
 async function submitAgentConfig(event) {
@@ -1004,6 +1329,7 @@ async function submitAgentConfig(event) {
     detailDialog.close();
     assignmentDraft = null;
     showToast(result.agent.connected ? "AGENT 已接入，可以分配角色" : "配置已保存，但命令尚不可用", result.agent.connected ? "success" : "danger");
+    if (result.agent.rollbackPath) showToast(`配置回滚点：${result.agent.rollbackPath}`);
     await refreshState({ quiet: true });
   } catch (error) {
     showToast(error.message, "danger");
@@ -1127,6 +1453,476 @@ function openEmailConfigDialog() {
   refreshIcons();
 }
 
+function missionOptions(selectedId) {
+  return (organizationState?.missions || [])
+    .map((mission) => `<option value="${escapeHtml(mission.id)}" ${mission.id === selectedId ? "selected" : ""}>${escapeHtml(mission.title)}（${escapeHtml(mission.status)}）</option>`)
+    .join("");
+}
+
+function openFormDialog(kicker, title, formId, fieldsHtml, submitLabel) {
+  detailContent.innerHTML = `
+    <header class="dialog-header"><div><span class="section-kicker">${escapeHtml(kicker)}</span><h2>${escapeHtml(title)}</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭" title="关闭">${icon("x")}</button></header>
+    <form class="agent-config-form" id="${formId}">
+      <div class="form-grid">${fieldsHtml}</div>
+      <footer class="dialog-actions"><button type="button" class="button button-secondary" data-close-dialog>取消</button><button type="submit" class="button button-primary">${escapeHtml(submitLabel)}</button></footer>
+    </form>`;
+  detailDialog.showModal();
+  detailContent.querySelectorAll("[data-close-dialog]").forEach((button) => {
+    button.addEventListener("click", () => detailDialog.close());
+  });
+  refreshIcons();
+}
+
+function missionField(selectedId) {
+  return `<label class="field-label form-span"><span>Mission</span><select name="missionId">${missionOptions(selectedId)}</select></label>`;
+}
+
+function openDecisionCreateDialog(missionId) {
+  openFormDialog("决策收件箱", "新建决策事项", "decisionCreateForm", `
+    ${missionField(missionId || activeMission()?.id)}
+    <label class="field-label form-span"><span>标题</span><input type="text" name="title" required /></label>
+    <label class="field-label"><span>类型</span><input type="text" name="kind" value="general" /></label>
+    <label class="field-label"><span>紧迫度</span><select name="urgency"><option value="normal">normal</option><option value="low">low</option><option value="high">high</option><option value="critical">critical</option></select></label>
+    <label class="field-label form-span"><span>事实</span><textarea name="facts" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>影响</span><textarea name="impacts" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>选项（每行一个）</span><textarea name="options" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>建议</span><input type="text" name="recommendation" /></label>`, "创建决策事项");
+  document.getElementById("decisionCreateForm")?.addEventListener("submit", submitDecisionCreate);
+}
+
+async function submitDecisionCreate(event) {
+  event.preventDefault();
+  if (requestInFlight) return;
+  const form = new FormData(event.currentTarget);
+  requestInFlight = true;
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/decisions`, {
+      method: "POST",
+      body: JSON.stringify({
+        title: form.get("title"),
+        kind: form.get("kind"),
+        facts: form.get("facts"),
+        impacts: form.get("impacts"),
+        options: String(form.get("options") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+        recommendation: form.get("recommendation"),
+        urgency: form.get("urgency"),
+      }),
+    });
+    detailDialog.close();
+    showToast("决策事项已创建");
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+async function resolveDecision(missionId, decisionId, resolution) {
+  if (requestInFlight) return;
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(missionId)}/decisions/${encodeURIComponent(decisionId)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution, decidedBy: "human-owner" }),
+    });
+    showToast(resolution === "approved" ? "已批准" : resolution === "rejected" ? "已驳回" : "已暂缓");
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+function openOverrideDialog(missionId) {
+  openFormDialog("三权分离 · 紧急绕过", "授予限时例外", "overrideForm", `
+    ${missionField(missionId || activeMission()?.id)}
+    <label class="field-label form-span"><span>被绕过的门禁（每行一个）</span><textarea name="gates" rows="2" required></textarea></label>
+    <label class="field-label form-span"><span>原因</span><textarea name="reason" rows="2" required></textarea></label>
+    <label class="field-label form-span"><span>承担风险</span><textarea name="risk" rows="2" required></textarea></label>
+    <label class="field-label"><span>到期时间</span><input type="datetime-local" name="expiresAt" required /></label>
+    <label class="field-label"><span>允许动作（逗号分隔）</span><input type="text" name="allowedActions" /></label>
+    <label class="field-label form-span"><span>回滚触发器</span><input type="text" name="rollbackTrigger" /></label>`, "授予绕过（自动建风险债务）");
+  document.getElementById("overrideForm")?.addEventListener("submit", submitOverride);
+}
+
+async function submitOverride(event) {
+  event.preventDefault();
+  if (requestInFlight) return;
+  const form = new FormData(event.currentTarget);
+  requestInFlight = true;
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/override`, {
+      method: "POST",
+      body: JSON.stringify({
+        decidedBy: "human-owner",
+        overriddenGates: String(form.get("gates") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+        reason: form.get("reason"),
+        risk: form.get("risk"),
+        expiresAt: form.get("expiresAt") ? new Date(form.get("expiresAt")).toISOString() : "",
+        allowedActions: String(form.get("allowedActions") || "").split(/[,，]/).map((line) => line.trim()).filter(Boolean),
+        rollbackTrigger: form.get("rollbackTrigger"),
+      }),
+    });
+    detailDialog.close();
+    showToast("紧急绕过已记录，失败事实仍保留");
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+function openWaitingDialog(missionId) {
+  openFormDialog("阻塞与恢复", "记录正常等待", "waitingForm", `
+    ${missionField(missionId || activeMission()?.id)}
+    <label class="field-label form-span"><span>等待原因</span><textarea name="reason" rows="2" required></textarea></label>
+    <label class="field-label"><span>责任角色</span><input type="text" name="responsibleRoleId" value="chief-manager" /></label>
+    <label class="field-label"><span>预计时间</span><input type="text" name="expectedAt" placeholder="如 2026-09-04T18:00" /></label>`, "记录等待");
+  document.getElementById("waitingForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/record-waiting`, {
+        method: "POST",
+        body: JSON.stringify({ reason: form.get("reason"), responsibleRoleId: form.get("responsibleRoleId"), expectedAt: form.get("expectedAt") }),
+      });
+      detailDialog.close();
+      showToast("等待条件已记录，不消耗模型调用");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openDevicePackageDialog(missionId) {
+  openFormDialog("质量与发布", "生成真机执行包", "devicePackageForm", `
+    ${missionField(missionId || activeMission()?.id)}
+    <label class="field-label"><span>版本号</span><input type="text" name="version" required /></label>
+    <label class="field-label"><span>构建身份</span><input type="text" name="buildIdentity" required /></label>
+    <label class="field-label form-span"><span>机型（每行一个）</span><textarea name="devices" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>前置条件（每行一个）</span><textarea name="preconditions" rows="2"></textarea></label>`, "生成执行包");
+  document.getElementById("devicePackageForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/device-package`, {
+        method: "POST",
+        body: JSON.stringify({
+          version: form.get("version"),
+          buildIdentity: form.get("buildIdentity"),
+          devices: String(form.get("devices") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+          preconditions: String(form.get("preconditions") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+        }),
+      });
+      detailDialog.close();
+      showToast("真机执行包已生成，请按包执行并回填证据");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openDeviceEvidenceDialog(missionId, packageId) {
+  const mission = (organizationState?.missions || []).find((item) => item.id === (missionId || activeMission()?.id));
+  const devicePackage = mission?.externalEvidencePackages?.find((item) => item.id === packageId)
+    || (mission?.externalEvidencePackages || []).find((item) => item.status === "open");
+  if (!devicePackage) {
+    showToast("没有可回填的真机执行包", "danger");
+    return;
+  }
+  openFormDialog("质量与发布", "回填真机证据", "deviceEvidenceForm", `
+    <input type="hidden" name="missionId" value="${escapeHtml(mission.id)}" />
+    <input type="hidden" name="packageId" value="${escapeHtml(devicePackage.id)}" />
+    <label class="field-label"><span>测试人</span><input type="text" name="tester" required /></label>
+    ${(devicePackage.steps || []).map((step) => `
+      <label class="field-label"><span>${escapeHtml(step.id)} 通过？</span><select name="result-${escapeHtml(step.id)}"><option value="passed">passed</option><option value="failed">failed</option><option value="blocked">blocked</option></select></label>
+      <label class="field-label form-span"><span>${escapeHtml(step.id)} 证据</span><input type="text" name="evidence-${escapeHtml(step.id)}" placeholder="${escapeHtml(step.action || "").slice(0, 60)}" /></label>`).join("")}`, "提交证据核对");
+  document.getElementById("deviceEvidenceForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/device-packages/${encodeURIComponent(form.get("packageId"))}/evidence`, {
+        method: "POST",
+        body: JSON.stringify({
+          tester: form.get("tester"),
+          results: (devicePackage.steps || []).map((step) => ({
+            stepId: step.id,
+            result: form.get(`result-${step.id}`),
+            evidence: form.get(`evidence-${step.id}`),
+          })),
+        }),
+      });
+      detailDialog.close();
+      showToast("真机证据已核对回填");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openCaseDialog() {
+  openFormDialog("认知与决策", "开启决策事项", "caseForm", `
+    ${missionField(activeMission()?.id)}
+    <label class="field-label form-span"><span>标题</span><input type="text" name="title" required /></label>
+    <label class="field-label form-span"><span>背景</span><textarea name="context" rows="2"></textarea></label>
+    <label class="field-label"><span>DecisionOwner</span><input type="text" name="ownerRoleId" value="human-owner" required /></label>`, "开启事项");
+  document.getElementById("caseForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/cases`, {
+        method: "POST",
+        body: JSON.stringify({ title: form.get("title"), context: form.get("context"), ownerRoleId: form.get("ownerRoleId") }),
+      });
+      detailDialog.close();
+      showToast("决策事项已开启，最终决定权已明确归属");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openIdeaDialog(missionId, caseId) {
+  openFormDialog("认知与决策", "补创造者创意", "ideaForm", `
+    <input type="hidden" name="missionId" value="${escapeHtml(missionId)}" />
+    <input type="hidden" name="caseId" value="${escapeHtml(caseId)}" />
+    <label class="field-label form-span"><span>问题重构</span><input type="text" name="problem" /></label>
+    <label class="field-label form-span"><span>方案簇（每行一个，至少一个）</span><textarea name="clusters" rows="3" required></textarea></label>
+    <label class="field-label form-span"><span>极端方案（每行一个）</span><textarea name="extremeOptions" rows="2"></textarea></label>`, "记录 IdeaSet");
+  document.getElementById("ideaForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/cases/${encodeURIComponent(form.get("caseId"))}/idea-sets`, {
+        method: "POST",
+        body: JSON.stringify({
+          decisionCaseId: form.get("caseId"),
+          problem: form.get("problem"),
+          clusters: String(form.get("clusters") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+          extremeOptions: String(form.get("extremeOptions") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+        }),
+      });
+      detailDialog.close();
+      showToast("IdeaSet 已记录，不淘汰方案");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openBriefDialog(missionId, caseId) {
+  openFormDialog("认知与决策", "写抉择简报", "briefForm", `
+    <input type="hidden" name="missionId" value="${escapeHtml(missionId)}" />
+    <input type="hidden" name="caseId" value="${escapeHtml(caseId)}" />
+    <label class="field-label form-span"><span>候选（每行一个，须覆盖全部）</span><textarea name="candidates" rows="2" required></textarea></label>
+    <label class="field-label form-span"><span>权衡</span><textarea name="tradeoffs" rows="2"></textarea></label>
+    <label class="field-label"><span>推荐方案</span><input type="text" name="recommendation" /></label>
+    <label class="field-label form-span"><span>少数意见（每行一个，可空但不可缺）</span><textarea name="minorityOpinions" rows="2"></textarea></label>`, "记录 DecisionBrief");
+  document.getElementById("briefForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/cases/${encodeURIComponent(form.get("caseId"))}/briefs`, {
+        method: "POST",
+        body: JSON.stringify({
+          candidates: String(form.get("candidates") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+          tradeoffs: form.get("tradeoffs"),
+          recommendation: form.get("recommendation"),
+          minorityOpinions: String(form.get("minorityOpinions") || "").split("\n").map((line) => line.trim()).filter(Boolean),
+        }),
+      });
+      detailDialog.close();
+      showToast("DecisionBrief 已记录，只给建议不做决定");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+async function decideCase(missionId, caseId, ownerId) {
+  const decision = window.prompt("请输入正式决定内容（决定权属于 " + ownerId + "）：");
+  if (!decision) return;
+  if (requestInFlight) return;
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(missionId)}/cases/${encodeURIComponent(caseId)}/decide`, {
+      method: "POST",
+      body: JSON.stringify({ decision, decidedBy: ownerId }),
+    });
+    showToast("正式决定已记录");
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+function openEvolutionDialog() {
+  openFormDialog("演进实验室", "提交演进提案", "evolutionForm", `
+    ${missionField(activeMission()?.id)}
+    <label class="field-label form-span"><span>有证据的问题</span><textarea name="problem" rows="2" required></textarea></label>
+    <label class="field-label form-span"><span>可证伪假设</span><textarea name="hypothesis" rows="2" required></textarea></label>
+    <label class="field-label form-span"><span>证据</span><textarea name="evidence" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>回滚方案</span><textarea name="rollback" rows="2"></textarea></label>`, "提交提案（不自动修改系统）");
+  document.getElementById("evolutionForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/evolutions`, {
+        method: "POST",
+        body: JSON.stringify({ problem: form.get("problem"), hypothesis: form.get("hypothesis"), evidence: form.get("evidence"), rollback: form.get("rollback") }),
+      });
+      detailDialog.close();
+      showToast("演进提案已提交，等待人类裁决");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openSkillDialog() {
+  openFormDialog("信息与技能", "登记技能候选", "skillForm", `
+    ${missionField(activeMission()?.id)}
+    <label class="field-label form-span"><span>名称</span><input type="text" name="name" required /></label>
+    <label class="field-label form-span"><span>描述</span><textarea name="description" rows="2"></textarea></label>
+    <label class="field-label form-span"><span>来源</span><input type="text" name="source" /></label>`, "登记候选");
+  document.getElementById("skillForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/skills`, {
+        method: "POST",
+        body: JSON.stringify({ name: form.get("name"), description: form.get("description"), source: form.get("source") }),
+      });
+      detailDialog.close();
+      showToast("技能候选已登记，发布前只是候选");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openManifestDialog() {
+  openFormDialog("质量与发布", "发布项目测试集", "manifestForm", `
+    <label class="field-label"><span>项目 ID</span><input type="text" name="projectId" value="${escapeHtml(organizationState?.project?.id || "")}" required /></label>
+    <label class="field-label"><span>版本</span><input type="text" name="version" placeholder="2026.09-mvp.2" required /></label>
+    <label class="field-label form-span"><span>必跑项 JSON 数组（id/name/command/environment）</span><textarea name="requiredTests" rows="4" spellcheck="false">[{"id":"t1","name":"冒烟","command":"run","environment":"冻结候选"}]</textarea></label>`, "发布测试集版本");
+  document.getElementById("manifestForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    let requiredTests;
+    try {
+      requiredTests = JSON.parse(form.get("requiredTests") || "[]");
+    } catch (error) {
+      showToast("必跑项 JSON 无效", "danger");
+      return;
+    }
+    requestInFlight = true;
+    try {
+      await api("/api/test-manifests", {
+        method: "POST",
+        body: JSON.stringify({ projectId: form.get("projectId"), version: form.get("version"), requiredTests }),
+      });
+      detailDialog.close();
+      showToast("测试集新版本已发布，重度模式将执行它");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openQualityDialog() {
+  const mission = activeMission();
+  if (!mission) return;
+  openFormDialog("质量与发布", "签署质量判定", "qualityForm", `
+    <input type="hidden" name="missionId" value="${escapeHtml(mission.id)}" />
+    <label class="field-label"><span>结论</span><select name="verdict"><option value="passed">passed</option><option value="blocked">blocked</option></select></label>
+    <label class="field-label form-span"><span>依据（复核与测试证据摘要）</span><textarea name="basis" rows="3"></textarea></label>`, "签署判定（不补写下级证据）");
+  document.getElementById("qualityForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/quality-decision`, {
+        method: "POST",
+        body: JSON.stringify({ verdict: form.get("verdict"), basis: form.get("basis"), decidedBy: "human-owner" }),
+      });
+      detailDialog.close();
+      showToast("质量判定已签署");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
 function captureEditorFocus() {
   const editor = document.activeElement;
   if (!(editor instanceof HTMLTextAreaElement) || editor.id !== "commandInput") return null;
@@ -1162,6 +1958,12 @@ function renderCurrentView(editorFocus = captureEditorFocus()) {
     const renderers = {
       workbench: renderWorkbench,
       missions: renderMissions,
+      decisions: renderDecisions,
+      blockers: renderBlockers,
+      quality: renderQuality,
+      cognition: renderCognition,
+      evolution: renderEvolution,
+      knowledge: renderKnowledge,
       organization: renderOrganization,
       ledger: renderLedger,
       resources: renderResources,
@@ -1194,17 +1996,19 @@ async function refreshState({ quiet = false } = {}) {
   if (!quiet) loading = true;
   if (!quiet) renderCurrentView();
   try {
-    const [state, health, ledger, configuration, email, governance] = await Promise.all([
+    const [state, health, ledger, configuration, email, governance, inspections] = await Promise.all([
       api("/api/organization/state"),
       api("/api/health"),
       api("/api/organization/events"),
       api("/api/configuration"),
       api("/api/channels/email"),
       api("/api/governance/status"),
+      api("/api/organization/inspections"),
     ]);
     organizationState = state;
     healthState = health;
     ledgerEvents = ledger.events || [];
+    inspectionState = inspections;
     configurationState = configuration;
     emailState = email;
     governanceState = governance;
@@ -1277,6 +2081,10 @@ async function submitCommand(event) {
       confirm_baseline: "需求基线已确认，群星的调律者开始组织规划",
       retry_blocked: "已启动有限恢复",
       start_heavy_review: "重度全量回顾已启动",
+      auto_heavy_review: "自动重度回顾评估已执行",
+      pause_requested: "安全暂停请求已下达",
+      emergency_stopped: "已紧急停止",
+      mission_cancelled: "Mission 已取消",
       query_status: "任务状态已刷新",
     };
     showToast(actionLabels[payload.action] || "命令已执行");
@@ -1316,18 +2124,44 @@ async function submitExternalEvidence(event) {
   }
 }
 
-async function missionAction(action) {
-  const mission = activeMission();
+async function missionAction(action, dataset = {}) {
+  const missions = organizationState?.missions || [];
+  const mission = (dataset.missionId && missions.find((item) => item.id === dataset.missionId)) || activeMission();
   if (!mission || requestInFlight) return;
   requestInFlight = true;
   renderCurrentView();
   try {
-    if (action === "confirm-baseline") {
+    if (action === "pause") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/pause`, { method: "POST" });
+      showToast("安全暂停请求已下达，正在保存现场");
+    } else if (action === "emergency-stop") {
+      if (!window.confirm("紧急停止将终止本次物理调用且不可恢复，继续吗？")) {
+        requestInFlight = false;
+        renderCurrentView();
+        return;
+      }
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/emergency-stop`, { method: "POST", body: JSON.stringify({}) });
+      showToast("已紧急停止，现场保留，等待人类决定下一步");
+    } else if (action === "cancel") {
+      if (!window.confirm(`取消 Mission「${mission.title}」吗？取消后不可恢复执行。`)) {
+        requestInFlight = false;
+        renderCurrentView();
+        return;
+      }
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/cancel`, { method: "POST", body: JSON.stringify({}) });
+      showToast("Mission 已取消");
+    } else if (action === "resume") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/resume`, { method: "POST" });
+      showToast("已从最近检查点继续运行");
+    } else if (action === "confirm-baseline") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/confirm-baseline`, { method: "POST" });
       showToast("需求基线已确认，群星的调律者开始组织规划");
     } else if (action === "retry") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/retry`, { method: "POST" });
       showToast("已在恢复预算内重新任职");
+    } else if (action === "start-heavy-review") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/start-heavy-review`, { method: "POST" });
+      showToast("重度全量回顾已启动");
     } else if (action === "verify-source") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/verify-source`, { method: "POST" });
       showToast("候选来源已核对并生成固定指纹");
@@ -1340,7 +2174,60 @@ async function missionAction(action) {
     } else if (action === "accept-result") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/accept-result`, { method: "POST" });
       showToast("业务结果已验收，Mission 完成");
+    } else if (action === "resolve-decision") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/decisions/${encodeURIComponent(dataset.decisionId)}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ resolution: dataset.resolution, decidedBy: "human-owner" }),
+      });
+      showToast(dataset.resolution === "approved" ? "已批准" : dataset.resolution === "rejected" ? "已驳回" : "已暂缓");
+    } else if (action === "close-waiting") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/waiting/${encodeURIComponent(dataset.waitingId)}/close`, { method: "POST", body: JSON.stringify({}) });
+      showToast("等待条件已关闭");
+    } else if (action === "decide-evolution") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/evolutions/${encodeURIComponent(dataset.proposalId)}/decide`, {
+        method: "POST",
+        body: JSON.stringify({ decision: dataset.decision, decidedBy: "human-owner" }),
+      });
+      showToast(dataset.decision === "approved" ? "演进提案已批准（批准不等于已应用）" : "演进提案已驳回");
+    } else if (action === "decide-skill") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/skills/${encodeURIComponent(dataset.skillId)}/decide`, {
+        method: "POST",
+        body: JSON.stringify({ decision: dataset.decision, decidedBy: "human-owner" }),
+      });
+      showToast(dataset.decision === "published" ? "技能已发布" : "技能已废弃");
+    } else if (action === "revert-action") {
+      const reason = window.prompt("请输入撤销原因（撤销将按备份恢复文件）：");
+      if (!reason) {
+        requestInFlight = false;
+        renderCurrentView();
+        return;
+      }
+      await api(`/api/governance/actions/${encodeURIComponent(dataset.actionId)}/revert`, {
+        method: "POST",
+        body: JSON.stringify({ reason, confirmedBy: "human-owner" }),
+      });
+      showToast("已按修改前备份撤销");
     }
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+async function setWorkflowProfile(profile) {
+  const mission = activeMission();
+  if (!mission || requestInFlight) return;
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/workflow-profile`, {
+      method: "POST",
+      body: JSON.stringify({ profile }),
+    });
+    showToast(`工作模式已设为${{ auto: "自动", light: "轻度", heavy: "重度" }[profile] || profile}`);
     await refreshState({ quiet: true });
   } catch (error) {
     showToast(error.message, "danger");
@@ -1380,12 +2267,28 @@ function bindDynamicEvents() {
         selectedMissionId = "__new__";
         switchView("workbench");
       }
-      else if (action === "request-baseline-change") document.getElementById("commandInput")?.focus();
+      else if (["request-baseline-change", "request-revision"].includes(action)) document.getElementById("commandInput")?.focus();
       else if (action === "refresh") refreshState();
       else if (action === "save-assignments") saveAssignments();
       else if (action === "new-agent") openAgentConfigDialog();
-      else missionAction(action);
+      else if (action === "new-decision") openDecisionCreateDialog(button.dataset.missionId);
+      else if (action === "new-override") openOverrideDialog(button.dataset.missionId);
+      else if (action === "new-waiting") openWaitingDialog(button.dataset.missionId);
+      else if (action === "new-manifest") openManifestDialog();
+      else if (action === "new-case") openCaseDialog();
+      else if (action === "new-idea") openIdeaDialog(button.dataset.missionId, button.dataset.caseId);
+      else if (action === "new-brief") openBriefDialog(button.dataset.missionId, button.dataset.caseId);
+      else if (action === "decide-case") decideCase(button.dataset.missionId, button.dataset.caseId, button.dataset.ownerId);
+      else if (action === "new-evolution") openEvolutionDialog();
+      else if (action === "new-skill") openSkillDialog();
+      else if (action === "device-package") openDevicePackageDialog(button.dataset.missionId);
+      else if (action === "device-evidence") openDeviceEvidenceDialog(button.dataset.missionId, button.dataset.packageId);
+      else if (action === "quality-decision") openQualityDialog();
+      else missionAction(action, button.dataset);
     });
+  });
+  mainContent.querySelectorAll("[data-workflow-profile]").forEach((button) => {
+    button.addEventListener("click", () => setWorkflowProfile(button.dataset.workflowProfile));
   });
   mainContent.querySelectorAll("[data-mission-id]").forEach((button) => {
     button.addEventListener("click", () => {

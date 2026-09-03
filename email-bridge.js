@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const { ImapFlow } = require("imapflow");
 const { simpleParser } = require("mailparser");
@@ -99,6 +100,32 @@ function missionIdFromSubject(subject) {
   return cleanText(subject, 1000).match(/\[mission:([^\]]+)\]/i)?.[1] || null;
 }
 
+const DEV_THREAD_MARK = "[BLACK SHORES-DEV]";
+
+function isDevThread(subject) {
+  return cleanText(subject, 1000).toUpperCase().includes(DEV_THREAD_MARK);
+}
+
+const DEV_REPLY_PREFIX = /^(re|fw|fwd|回复|答复)\s*[:：]/i;
+
+function isDevReply(subject) {
+  return isDevThread(subject) && DEV_REPLY_PREFIX.test(cleanText(subject, 1000));
+}
+
+function fingerprintMail(subject, text) {
+  const normalizedSubject = cleanText(subject, 1000)
+    .replace(/^re:\s*/i, "")
+    .replace(/\[mission:[^\]]+\]/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const normalizedBody = commandTextFromEmail({ text })
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+  return crypto.createHash("sha256").update(`${normalizedSubject}\n${normalizedBody}`, "utf8").digest("hex");
+}
+
 class EmailBridge {
   constructor({
     secretsPath,
@@ -108,9 +135,13 @@ class EmailBridge {
     createImapClient = (options) => new ImapFlow(options),
     createTransport = (options) => nodemailer.createTransport(options),
     parseMail = simpleParser,
+    logoutTimeoutMs = 8000,
+    imapOpTimeoutMs = 30000,
+    devInboxPath = null,
   }) {
     this.secretsPath = path.resolve(secretsPath);
     this.statePath = path.resolve(statePath);
+    this.devInboxPath = path.resolve(devInboxPath || path.join(path.dirname(this.statePath), "dev-inbox.jsonl"));
     this.organization = organization;
     this.ledger = ledger;
     this.createImapClient = createImapClient;
@@ -118,6 +149,20 @@ class EmailBridge {
     this.parseMail = parseMail;
     this.config = this._loadJson(this.secretsPath, {});
     this.notificationState = this._loadJson(this.statePath, { initialized: false, eventIds: [] });
+    this.logoutTimeoutMs = logoutTimeoutMs;
+    this.imapOpTimeoutMs = imapOpTimeoutMs;
+    this.sentMessageIds = new Set(
+      [...this._sentIdsFromLedger(), ...this._sentIdsFromState(this.notificationState)].slice(-2000),
+    );
+    this.sentFingerprints = new Set(
+      (Array.isArray(this.notificationState.sentFingerprints) ? this.notificationState.sentFingerprints : [])
+        .map((id) => cleanText(id, 128))
+        .filter(Boolean)
+        .slice(-2000),
+    );
+    this.receivedMessageIds = new Set(
+      [...this._receivedIdsFromLedger(), ...this._receivedIdsFromState(this.notificationState)].slice(-2000),
+    );
     this.timer = null;
     this.started = false;
     this.inFlight = false;
@@ -194,18 +239,35 @@ class EmailBridge {
     let client;
     try {
       client = this.createImapClient(this._imapOptions());
-      await client.connect();
-      await client.mailboxOpen("INBOX");
-      const unseen = await client.search({ seen: false }, { uid: true });
-      if (unseen.length) {
-        for await (const message of client.fetch(unseen, { uid: true, source: true }, { uid: true })) {
+      await this._withTimeout(client.connect(), "连接收件箱");
+      const box = await this._withTimeout(client.mailboxOpen("INBOX"), "打开收件箱");
+      const cursorOk = Number(this.notificationState.imapUidValidity) === Number(box?.uidValidity)
+        && Number.isFinite(Number(box?.uidValidity));
+      const sinceUid = cursorOk ? Number(this.notificationState.imapLastUid) || 0 : 0;
+      const found = await this._withTimeout(client.search({ uid: `${sinceUid + 1}:*` }, { uid: true }), "检索新邮件");
+      const uids = (found || []).map((value) => Number(value)).filter((uid) => Number.isInteger(uid) && uid > sinceUid);
+      if (!cursorOk) {
+        this._updateImapCursor(box?.uidValidity, uids.length ? Math.max(...uids) : sinceUid);
+      } else if (uids.length) {
+        const messages = await this._fetchUnseenSources(client, uids);
+        let maxUid = sinceUid;
+        for (const message of messages) {
+          let parsed = null;
           try {
-            const parsed = await this.parseMail(message.source);
+            parsed = await this.parseMail(message.source);
             await this.acceptParsedMessage(parsed);
-          } finally {
-            await client.messageFlagsAdd(message.uid, ["\\Seen"], { uid: true });
+            this._rememberReceivedId(parsed?.messageId);
+          } catch (messageError) {
+            if (parsed) this._rememberReceivedId(parsed?.messageId);
+            this.ledger.append("email.channel_error", {
+              actorRoleId: "channel-email",
+              payload: { stage: "accept", error: cleanText(messageError.message || String(messageError), 2000) },
+            });
           }
+          const fetchedUid = Number(message?.uid);
+          if (Number.isInteger(fetchedUid) && fetchedUid > maxUid) maxUid = fetchedUid;
         }
+        this._updateImapCursor(box?.uidValidity, maxUid);
       }
       await this.sendPendingNotifications();
       this.runtime.status = "connected";
@@ -220,7 +282,12 @@ class EmailBridge {
       throw error;
     } finally {
       this.inFlight = false;
-      if (client) await client.logout().catch(() => {});
+      if (client) {
+        await Promise.race([
+          client.logout().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, this.logoutTimeoutMs)),
+        ]);
+      }
     }
     return this.publicState();
   }
@@ -236,11 +303,40 @@ class EmailBridge {
       });
       return { ignored: true };
     }
+    if (isDevThread(subject)) {
+      this.ledger.append("email.command_ignored", {
+        actorRoleId: "channel-email",
+        payload: { sender, subject, messageId, reason: "dev_thread" },
+      });
+      if (isDevReply(subject)) this._queueDevReply(parsed, { sender, subject, messageId });
+      return { ignored: true };
+    }
+    if (messageId && this.receivedMessageIds.has(messageId)) {
+      this.ledger.append("email.command_ignored", {
+        actorRoleId: "channel-email",
+        payload: { sender, subject, messageId, reason: "duplicate_delivery" },
+      });
+      return { ignored: true };
+    }
+    if (messageId && this.sentMessageIds.has(messageId)) {
+      this.ledger.append("email.command_ignored", {
+        actorRoleId: "channel-email",
+        payload: { sender, subject, messageId, reason: "self_notification" },
+      });
+      return { ignored: true };
+    }
     const content = commandTextFromEmail(parsed);
     if (!content) {
       this.ledger.append("email.command_ignored", {
         actorRoleId: "channel-email",
         payload: { sender, subject, messageId, reason: "empty_command" },
+      });
+      return { ignored: true };
+    }
+    if (this.sentFingerprints.has(fingerprintMail(subject, content))) {
+      this.ledger.append("email.command_ignored", {
+        actorRoleId: "channel-email",
+        payload: { sender, subject, messageId, reason: "self_notification" },
       });
       return { ignored: true };
     }
@@ -281,20 +377,45 @@ class EmailBridge {
     const pending = events.filter((event) => !known.has(event.id) && this._requiresHuman(event));
     for (const event of pending) {
       const mission = event.missionId ? this.organization.mission(event.missionId) : null;
+      const decision = event.type === "decision.requested"
+        ? mission?.decisions?.find((item) => item.id === event.payload.id) || event.payload
+        : null;
+      const subject = decision
+        ? `[BLACK SHORES][mission:${event.missionId}] 需要决策：${decision.title || event.payload.title}`
+        : `[BLACK SHORES][mission:${event.missionId}] 需要处理`;
       const reason = event.type === "blocker.opened"
         ? event.payload.error || "Mission 已阻塞"
-        : event.payload.reason || mission?.statusReason || "需要人类处理";
+        : decision
+          ? `决策事项：${decision.title}\n事实：${decision.facts || "—"}\n影响：${decision.impacts || "—"}\n选项：${(decision.options || []).join(" / ") || "—"}\n建议：${decision.recommendation || "—"}\n对象版本：${decision.objectVersion || "—"}`
+          : event.payload.reason || mission?.statusReason || "需要人类处理";
       await this._send({
         to: this.config.ownerAddress,
-        subject: `[BLACK SHORES][mission:${event.missionId}] 需要处理`,
-        text: `群星的调律者请求你处理 Mission。\n\n任务：${mission?.title || event.missionId}\n状态：${mission?.status || event.type}\n原因：${reason}\n\n直接回复本邮件即可继续下达命令。`,
+        subject,
+        text: decision
+          ? `群星的调律者请求你裁决。\n\n任务：${mission?.title || event.missionId}\n${reason}\n\n直接回复“批准/驳回/暂缓：${decision.title}”并注明决策编号 ${decision.id}。`
+          : `群星的调律者请求你处理 Mission。\n\n任务：${mission?.title || event.missionId}\n状态：${mission?.status || event.type}\n原因：${reason}\n\n直接回复本邮件即可继续下达命令。`,
       });
       known.add(event.id);
     }
     for (const event of events) known.add(event.id);
-    this.notificationState = { initialized: true, eventIds: [...known].slice(-2000) };
+    this.notificationState = { ...this.notificationState, initialized: true, eventIds: [...known].slice(-2000) };
     this._writeJson(this.statePath, this.notificationState);
     return pending.length;
+  }
+
+  async notifyOwner(subject, text) {
+    if (!this.config.enabled || !this.config.ownerAddress || !this.config.password) {
+      throw Object.assign(new Error("请先启用并保存邮箱通道"), { statusCode: 409 });
+    }
+    const title = cleanText(subject, 200);
+    const body = cleanText(text, 12000);
+    if (!title || !body) throw Object.assign(new Error("通知主题和正文不能为空"), { statusCode: 400 });
+    const info = await this._send({
+      to: this.config.ownerAddress,
+      subject: `[BLACK SHORES] ${title}`,
+      text: `${body}\n\n——直接回复本邮件即可下达命令（仅 ${this.config.ownerAddress} 的回复会被执行）。`,
+    });
+    return { messageId: cleanText(info?.messageId, 1000), subject: `[BLACK SHORES] ${title}` };
   }
 
   async testConnection() {
@@ -320,6 +441,7 @@ class EmailBridge {
 
   _requiresHuman(event) {
     if (event.type === "blocker.opened") return true;
+    if (event.type === "decision.requested") return true;
     return event.type === "mission.status_changed" && new Set([
       "awaiting_baseline_confirmation",
       "awaiting_release_approval",
@@ -331,6 +453,7 @@ class EmailBridge {
   _initializeNotificationCursor() {
     if (this.notificationState.initialized) return;
     this.notificationState = {
+      ...this.notificationState,
       initialized: true,
       eventIds: this.ledger.events().map((event) => event.id).slice(-2000),
     };
@@ -373,18 +496,143 @@ class EmailBridge {
       subject,
       text,
     });
+    const sentId = cleanText(info?.messageId, 1000);
+    if (sentId) this._rememberSentMessageId(sentId);
+    this._rememberFingerprint(fingerprintMail(subject, text));
     this.runtime.lastSentAt = new Date().toISOString();
     this.ledger.append("email.notification_sent", {
       actorRoleId: "channel-email",
-      payload: { to, subject, messageId: cleanText(info?.messageId, 1000) },
+      payload: { to, subject, messageId: sentId },
     });
     return info;
+  }
+
+  _withTimeout(promise, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`邮箱 IMAP 超时：${label}`)), this.imapOpTimeoutMs);
+    });
+    return Promise.race([Promise.resolve(promise).finally(() => clearTimeout(timer)), timeout]);
+  }
+
+  async _fetchUnseenSources(client, uids) {
+    const messages = [];
+    const iterator = client.fetch(uids, { uid: true, source: true }, { uid: true })[Symbol.asyncIterator]();
+    while (true) {
+      const step = await this._withTimeout(iterator.next(), "收取邮件正文");
+      if (!step || step.done) break;
+      messages.push(step.value);
+    }
+    return messages;
   }
 
   _replySubject(subject, missionId) {
     const base = subject || "BLACK SHORES 命令";
     const token = missionId && !base.includes("[mission:") ? `[mission:${missionId}] ` : "";
     return `${/^re:/i.test(base) ? "" : "Re: "}${token}${base}`;
+  }
+
+  _sentIdsFromLedger() {
+    try {
+      return this.ledger.events()
+        .filter((event) => event.type === "email.notification_sent")
+        .map((event) => cleanText(event.payload?.messageId, 1000))
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  _sentIdsFromState(state) {
+    const ids = state?.sentMessageIds;
+    return Array.isArray(ids) ? ids.map((id) => cleanText(id, 1000)).filter(Boolean) : [];
+  }
+
+  _rememberSentMessageId(messageId) {
+    const id = cleanText(messageId, 1000);
+    if (!id) return;
+    this.sentMessageIds.add(id);
+    while (this.sentMessageIds.size > 2000) {
+      this.sentMessageIds.delete(this.sentMessageIds.values().next().value);
+    }
+    this.notificationState = { ...this.notificationState, sentMessageIds: [...this.sentMessageIds].slice(-2000) };
+    this._writeJson(this.statePath, this.notificationState);
+  }
+
+  _rememberFingerprint(fingerprint) {
+    const id = cleanText(fingerprint, 128);
+    if (!id) return;
+    this.sentFingerprints.add(id);
+    while (this.sentFingerprints.size > 2000) {
+      this.sentFingerprints.delete(this.sentFingerprints.values().next().value);
+    }
+    this.notificationState = { ...this.notificationState, sentFingerprints: [...this.sentFingerprints].slice(-2000) };
+    this._writeJson(this.statePath, this.notificationState);
+  }
+
+  _receivedIdsFromLedger() {
+    try {
+      return this.ledger.events()
+        .filter((event) => event.type === "email.command_received" || event.type === "email.command_ignored")
+        .map((event) => cleanText(event.payload?.messageId, 1000))
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  _receivedIdsFromState(state) {
+    const ids = state?.receivedMessageIds;
+    return Array.isArray(ids) ? ids.map((id) => cleanText(id, 1000)).filter(Boolean) : [];
+  }
+
+  _rememberReceivedId(messageId) {
+    const id = cleanText(messageId, 1000);
+    if (!id) return;
+    this.receivedMessageIds.add(id);
+    while (this.receivedMessageIds.size > 2000) {
+      this.receivedMessageIds.delete(this.receivedMessageIds.values().next().value);
+    }
+    this.notificationState = { ...this.notificationState, receivedMessageIds: [...this.receivedMessageIds].slice(-2000) };
+    this._writeJson(this.statePath, this.notificationState);
+  }
+
+  _updateImapCursor(uidValidity, lastUid) {
+    const validity = Number(uidValidity);
+    const uid = Number(lastUid);
+    this.notificationState = {
+      ...this.notificationState,
+      imapUidValidity: Number.isFinite(validity) && validity > 0 ? validity : null,
+      imapLastUid: Number.isFinite(uid) && uid > 0 ? Math.floor(uid) : 0,
+    };
+    this._writeJson(this.statePath, this.notificationState);
+  }
+
+  _queueDevReply(parsed, { sender, subject, messageId }) {
+    try {
+      const record = {
+        id: `devmail-${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffff).toString(16)}`,
+        at: new Date().toISOString(),
+        channel: "dev-email",
+        sender,
+        subject,
+        messageId,
+        inReplyTo: cleanText(parsed?.inReplyTo, 1000),
+        text: commandTextFromEmail(parsed),
+      };
+      fs.mkdirSync(path.dirname(this.devInboxPath), { recursive: true });
+      fs.appendFileSync(this.devInboxPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+      try { fs.chmodSync(this.devInboxPath, 0o600); } catch {}
+      this.ledger.append("email.dev_queued", {
+        actorRoleId: "channel-email",
+        payload: { subject, messageId, queueId: record.id },
+      });
+    } catch (error) {
+      this.ledger.append("email.channel_error", {
+        actorRoleId: "channel-email",
+        payload: { stage: "dev_queue", error: cleanText(error.message || String(error), 2000) },
+      });
+    }
   }
 
   _loadJson(filePath, fallback) {
@@ -405,7 +653,11 @@ class EmailBridge {
 module.exports = {
   EmailBridge,
   PROVIDERS,
+  DEV_THREAD_MARK,
   commandTextFromEmail,
+  fingerprintMail,
+  isDevReply,
+  isDevThread,
   missionIdFromSubject,
   normalizeEmailConfig,
 };

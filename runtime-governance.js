@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
@@ -137,6 +138,56 @@ class RuntimeGovernance {
     return record;
   }
 
+  revertAction(actionId, input = {}) {
+    const decidedBy = typeof input.confirmedBy === "string" ? input.confirmedBy : "";
+    if (decidedBy !== "human-owner") {
+      throw Object.assign(new Error("撤销改动必须由人类负责人另行确认"), { statusCode: 403 });
+    }
+    const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+    if (reason.length < 4) throw Object.assign(new Error("撤销改动需要说明原因"), { statusCode: 400 });
+    const actionIdText = String(actionId || "").trim();
+    const recorded = this.ledger.events().find(
+      (event) => event.type === "role_action.recorded" && event.payload?.actionId === actionIdText,
+    );
+    if (!recorded) throw Object.assign(new Error("找不到指定的角色动作留痕"), { statusCode: 404 });
+    if (this.ledger.events().some((event) => event.type === "action.reverted" && event.payload?.actionId === actionIdText)) {
+      throw Object.assign(new Error("该动作已经撤销过，不能重复撤销"), { statusCode: 409 });
+    }
+    const archive = recorded.payload?.backupArchive;
+    if (!archive || !fs.existsSync(archive)) {
+      throw Object.assign(new Error("没有修改前备份，不能安全撤销"), { statusCode: 409 });
+    }
+    const workingDirectory = path.resolve(recorded.payload?.workingDirectory || this._traceWorkingDirectory(recorded) || this.project.workingDirectory);
+    const explicit = Array.isArray(input.paths) ? input.paths.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const detected = this._traceChangedPaths(recorded);
+    const targets = [...new Set([...explicit, ...detected])].slice(0, 200);
+    if (!targets.length) throw Object.assign(new Error("无法确定变更范围，请明确列出要恢复的文件"), { statusCode: 400 });
+    const extractDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "black-shores-revert-"));
+    this._expandArchive(archive, extractDirectory);
+    const restored = [];
+    const deleted = [];
+    for (const relative of targets) {
+      if (relative.includes("..") || path.isAbsolute(relative)) continue;
+      const source = path.join(extractDirectory, relative);
+      const destination = path.join(workingDirectory, relative);
+      if (fs.existsSync(source) && fs.statSync(source).isFile()) {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.copyFileSync(source, destination);
+        restored.push(relative);
+      } else if (fs.existsSync(destination) && fs.statSync(destination).isFile()) {
+        fs.rmSync(destination);
+        deleted.push(relative);
+      }
+    }
+    fs.rmSync(extractDirectory, { recursive: true, force: true });
+    this.ledger.append("action.reverted", {
+      missionId: recorded.missionId,
+      actorRoleId: "human-owner",
+      payload: { actionId: actionIdText, restored, deleted, backupArchive: archive, reason },
+    });
+    return { actionId: actionIdText, restored, deleted };
+  }
+
   status() {
     const backupFiles = this._files(this.backupDirectory, ".zip");
     const traceFiles = this._files(this.traceDirectory, ".jsonl");
@@ -204,8 +255,57 @@ class RuntimeGovernance {
     return record;
   }
 
-  _files(directory, extension) {
-    if (!fs.existsSync(directory)) return [];
+  _traceRecord(tracePath, actionId) {
+    try {
+      const content = fs.readFileSync(tracePath, "utf8");
+      for (const line of content.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line);
+          if (record?.actionId === actionId) return record;
+        } catch {}
+      }
+    } catch {}
+    return null;
+  }
+
+  _traceWorkingDirectory(recorded) {
+    const tracePath = recorded.payload?.tracePath;
+    if (!tracePath || !fs.existsSync(tracePath)) return null;
+    return this._traceRecord(tracePath, recorded.payload.actionId)?.actionObject?.workingDirectory || null;
+  }
+
+  _traceChangedPaths(recorded) {
+    const tracePath = recorded.payload?.tracePath;
+    const fromPayload = Array.isArray(recorded.payload?.changedPaths) ? recorded.payload.changedPaths : [];
+    const fromTrace = (() => {
+      if (!tracePath || !fs.existsSync(tracePath)) return [];
+      return this._traceRecord(tracePath, recorded.payload.actionId)?.actionScope?.detectedChanges || [];
+    })();
+    const out = [];
+    for (const line of [...fromPayload, ...fromTrace]) {
+      const text = String(line || "");
+      const withoutStatus = text.replace(/^.{0,3}\s+/, "").trim();
+      const renamed = withoutStatus.split(" -> ").at(-1).trim();
+      if (renamed && !renamed.includes("..") && !path.isAbsolute(renamed)) out.push(renamed);
+    }
+    return [...new Set(out)];
+  }
+
+  _expandArchive(archivePath, extractDirectory) {
+    if (process.platform !== "win32") {
+      throw new Error("当前仅在 Windows 本机支持从备份恢复");
+    }
+    const quoted = (value) => `'${String(value).replace(/'/g, "''")}'`;
+    const result = spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", `Expand-Archive -LiteralPath ${quoted(archivePath)} -DestinationPath ${quoted(extractDirectory)} -Force`],
+      { encoding: "utf8", windowsHide: true, timeout: 120_000 },
+    );
+    if (result.status !== 0) throw new Error(`备份解包失败：${String(result.stderr || result.stdout || "未知错误").trim().slice(0, 1000)}`);
+  }
+
+  _files(directory, extension) {    if (!fs.existsSync(directory)) return [];
     const files = [];
     const pending = [directory];
     while (pending.length) {
