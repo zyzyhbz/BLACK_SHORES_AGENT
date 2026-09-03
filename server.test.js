@@ -23,7 +23,7 @@ function allocatePort() {
   });
 }
 
-async function startServer({ ledgerPath, worktree, manager, adapters }) {
+async function startServer({ ledgerPath, worktree, manager, roles, adapters }) {
   const port = await allocatePort();
   const configPath = path.join(path.dirname(ledgerPath), "black-shores.config.json");
   fs.writeFileSync(
@@ -37,6 +37,7 @@ async function startServer({ ledgerPath, worktree, manager, adapters }) {
         sourceRef: "origin/main",
       },
       manager: manager || { adapter: "auto", model: "", reasoningEffort: "" },
+      roles: roles || {},
       ledger: { path: ledgerPath },
       testManifest: { id: "ptm-server-test", version: "1", requiredTests: [] },
       adapters: adapters || {
@@ -76,7 +77,7 @@ async function startServer({ ledgerPath, worktree, manager, adapters }) {
       reject(new Error(`服务提前退出 (${code})：${output}`));
     });
   });
-  return { child, origin: `http://127.0.0.1:${port}` };
+  return { child, origin: `http://127.0.0.1:${port}`, configPath };
 }
 
 async function stopServer(child) {
@@ -219,4 +220,97 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   assert.equal(mission.runs[0].adapterId, "vendor-agent");
   assert.equal(mission.runs[0].model, "vendor/model-x");
   assert.match(mission.messages.at(-1).content, /验收环境/);
+});
+
+test("configuration API persists manager and per-role assignments and registers a new AGENT", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({
+    ledgerPath: path.join(directory, "ledger.jsonl"),
+    worktree: directory,
+    manager: { adapter: "vendor-agent", model: "vendor/model-x", reasoningEffort: "high" },
+    adapters: {
+      codex: { enabled: false },
+      cursor: { enabled: false },
+      zcode: { enabled: false },
+      grok: { enabled: false },
+      custom: [{
+        id: "vendor-agent",
+        label: "Vendor AGENT",
+        enabled: true,
+        command: process.execPath,
+        args: ["-e", "process.stdin.resume()"],
+        promptMode: "stdin",
+        outputFormat: "text",
+        model: "vendor/model-x",
+        models: ["vendor/model-x"],
+        reasoningEffort: "high",
+        reasoningOptions: ["high"],
+      }],
+    },
+  });
+  context.after(() => stopServer(server.child));
+
+  const initial = await (await fetch(`${server.origin}/api/configuration`)).json();
+  assert.equal(initial.manager.adapter, "vendor-agent");
+  assert.deepEqual(initial.roles, {});
+
+  const invalidResponse = await fetch(`${server.origin}/api/configuration/assignments`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      manager: { adapter: "vendor-agent", model: "vendor/model-x", reasoningEffort: "low" },
+      roles: {},
+    }),
+  });
+  assert.equal(invalidResponse.status, 400);
+  assert.match((await invalidResponse.json()).error, /不支持推理强度 low/);
+
+  const saveResponse = await fetch(`${server.origin}/api/configuration/assignments`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      manager: { adapter: "vendor-agent", model: "vendor/model-x", reasoningEffort: "high" },
+      roles: {
+        engineering: { adapter: "vendor-agent", model: "vendor/model-x", reasoningEffort: "high" },
+        tester: { inherit: true },
+      },
+    }),
+  });
+  assert.equal(saveResponse.status, 200);
+  const saved = await saveResponse.json();
+  assert.deepEqual(Object.keys(saved.roles), ["engineering"]);
+  assert.equal(saved.appliesTo, "next-physical-invocation");
+
+  const state = await (await fetch(`${server.origin}/api/organization/state`)).json();
+  assert.equal(state.roleAssignments.engineering.adapterId, "vendor-agent");
+  assert.equal(state.roleAssignments.engineering.inherited, false);
+  assert.equal(state.roleAssignments.tester.adapterId, "vendor-agent");
+  assert.equal(state.roleAssignments.tester.inherited, true);
+  const persisted = JSON.parse(fs.readFileSync(server.configPath, "utf8"));
+  assert.equal(persisted.roles.engineering.model, "vendor/model-x");
+  assert.equal(persisted.roles.tester, undefined);
+
+  const addResponse = await fetch(`${server.origin}/api/configuration/adapters`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "second-vendor",
+      label: "Second Vendor",
+      command: process.execPath,
+      args: ["-e", "process.stdin.resume()"],
+      promptMode: "stdin",
+      outputFormat: "text",
+      model: "second/model-y",
+      reasoningEffort: "medium",
+      skipVersionCheck: true,
+    }),
+  });
+  assert.equal(addResponse.status, 201);
+  const added = await addResponse.json();
+  assert.equal(added.agent.connected, true);
+  assert.equal(added.agent.model, "second/model-y");
+  const health = await (await fetch(`${server.origin}/api/health`)).json();
+  assert.equal(health.agents["second-vendor"].connected, true);
+  const updatedConfig = JSON.parse(fs.readFileSync(server.configPath, "utf8"));
+  assert.ok(updatedConfig.adapters.custom.some((adapter) => adapter.id === "second-vendor"));
 });

@@ -422,7 +422,9 @@ const adapters = {
     model: process.env.BLACK_SHORES_CODEX_MODEL || appConfig.adapters.codex.model || "",
     reasoningEffort:
       process.env.BLACK_SHORES_CODEX_REASONING || appConfig.adapters.codex.reasoningEffort || "",
-    modelOptions: [],
+    modelOptions: Array.isArray(appConfig.adapters.codex.models)
+      ? appConfig.adapters.codex.models.map(String)
+      : [],
     reasoningOptions: ["minimal", "low", "medium", "high", "xhigh"],
     supportsReasoning: true,
     permissionMode: "full-access",
@@ -624,7 +626,7 @@ for (const definition of appConfig.adapters.custom) {
   if (adapter && !adapters[adapter.id]) adapters[adapter.id] = adapter;
 }
 
-for (const adapter of Object.values(adapters)) {
+function refreshAdapterStatus(adapter) {
   adapter.installed = Boolean(adapter.command && (adapter.version || adapter.skipVersionCheck));
   adapter.connected = adapter.installed && adapter.configurationReady !== false;
   adapter.message = !adapter.installed
@@ -635,6 +637,8 @@ for (const adapter of Object.values(adapters)) {
         ? "复用本机 ZCode 桌面配置，凭据不会进入网页"
       : "使用本机登录状态，凭据不会进入网页";
 }
+
+for (const adapter of Object.values(adapters)) refreshAdapterStatus(adapter);
 
 function resolveAssignment(input = {}, fallback = null) {
   const requestedId = String(input.adapter || input.adapterId || "auto").trim().toLowerCase();
@@ -683,6 +687,133 @@ const roleAssignments = Object.fromEntries(
     resolveAssignment(assignment, managerAssignment),
   ]),
 );
+
+function configurationForDisk() {
+  return {
+    product: appConfig.product,
+    project: {
+      id: appConfig.project.id,
+      name: appConfig.project.name,
+      path: appConfig.project.path,
+      repository: appConfig.project.repository,
+      sourceRef: appConfig.project.sourceRef,
+    },
+    manager: appConfig.manager,
+    roles: appConfig.roles,
+    ledger: { path: appConfig.ledger.path },
+    testManifest: appConfig.testManifest,
+    adapters: appConfig.adapters,
+  };
+}
+
+function persistConfiguration() {
+  fs.mkdirSync(path.dirname(appConfig.configPath), { recursive: true });
+  fs.writeFileSync(
+    appConfig.configPath,
+    `${JSON.stringify(configurationForDisk(), null, 2)}\n`,
+    "utf8",
+  );
+  appConfig.configured = true;
+}
+
+function normalizeAssignmentInput(input, fallback = null) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw Object.assign(new Error("AGENT 任职必须是对象"), { statusCode: 400 });
+  }
+  const requestedId = readRunOption(input.adapter || input.adapterId, "auto", "适配器").toLowerCase();
+  const adapter = requestedId === "auto"
+    ? Object.values(adapters).find((candidate) => candidate.connected)
+    : adapters[requestedId];
+  if (!adapter?.connected) {
+    throw Object.assign(
+      new Error(adapter?.message || "没有可用于该任职的 AGENT 适配器"),
+      { statusCode: 409 },
+    );
+  }
+  const settings = resolveRunSettings(adapter, {
+    model: input.model || fallback?.model || adapter.model,
+    reasoningEffort:
+      input.reasoningEffort || fallback?.reasoningEffort || adapter.reasoningEffort,
+  });
+  const raw = {
+    adapter: requestedId,
+    model: settings.requestedModel,
+    reasoningEffort: settings.reasoningEffort,
+  };
+  return { raw, resolved: resolveAssignment(raw, fallback) };
+}
+
+function applyAssignmentConfiguration(payload) {
+  const normalizedManager = normalizeAssignmentInput(payload.manager || appConfig.manager);
+  const requestedRoles = payload.roles && typeof payload.roles === "object" ? payload.roles : {};
+  const roleIds = new Set(organization.state().roles.map((role) => role.id));
+  const rawRoles = {};
+  const resolvedRoles = {};
+  for (const [roleId, input] of Object.entries(requestedRoles)) {
+    if (!roleIds.has(roleId)) {
+      throw Object.assign(new Error(`未知角色：${roleId}`), { statusCode: 400 });
+    }
+    if (input?.inherit === true) continue;
+    const normalized = normalizeAssignmentInput(input, normalizedManager.resolved);
+    rawRoles[roleId] = normalized.raw;
+    resolvedRoles[roleId] = normalized.resolved;
+  }
+  appConfig.manager = normalizedManager.raw;
+  appConfig.roles = rawRoles;
+  Object.assign(managerAssignment, normalizedManager.resolved);
+  for (const key of Object.keys(roleAssignments)) delete roleAssignments[key];
+  Object.assign(roleAssignments, resolvedRoles);
+  persistConfiguration();
+  return organization.setAssignments({
+    managerAssignment,
+    roleAssignments,
+  });
+}
+
+function normalizeCustomAdapterInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw Object.assign(new Error("自定义 AGENT 配置必须是对象"), { statusCode: 400 });
+  }
+  const id = readRunOption(input.id, "", "AGENT ID").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) {
+    throw Object.assign(new Error("AGENT ID 只能包含小写字母、数字和连字符，长度为 2-63"), { statusCode: 400 });
+  }
+  if (adapters[id]) throw Object.assign(new Error(`AGENT ${id} 已存在`), { statusCode: 409 });
+  const command = readRunOption(input.command, "", "可执行命令");
+  if (!command) throw Object.assign(new Error("必须填写可执行命令"), { statusCode: 400 });
+  const args = Array.isArray(input.args) ? input.args.map((item) => String(item)) : [];
+  if (args.length > 64 || args.some((item) => item.length > 2000)) {
+    throw Object.assign(new Error("命令参数超出限制"), { statusCode: 400 });
+  }
+  const model = readRunOption(input.model, "", "模型");
+  if (!model) throw Object.assign(new Error("必须配置至少一个模型"), { statusCode: 400 });
+  const reasoningEffort = readRunOption(input.reasoningEffort, "default", "推理强度");
+  return {
+    id,
+    label: readRunOption(input.label, id, "名称"),
+    enabled: true,
+    command,
+    args,
+    promptMode: input.promptMode === "argument" ? "argument" : "stdin",
+    outputFormat: input.outputFormat === "ndjson" ? "ndjson" : "text",
+    skipVersionCheck: input.skipVersionCheck === true,
+    model,
+    models: [model],
+    reasoningEffort,
+    reasoningOptions: [reasoningEffort],
+    permissionMode: "configured-by-owner",
+  };
+}
+
+function addCustomAdapter(input) {
+  const definition = normalizeCustomAdapterInput(input);
+  const adapter = createCustomAdapter(definition);
+  refreshAdapterStatus(adapter);
+  adapters[adapter.id] = adapter;
+  appConfig.adapters.custom.push(definition);
+  persistConfiguration();
+  return publicAdapter(adapter);
+}
 
 function publicAdapter(adapter) {
   return {
@@ -1416,6 +1547,42 @@ const server = http.createServer(async (request, response) => {
       .events()
       .filter((event) => !missionId || event.missionId === missionId);
     sendJson(response, 200, { events });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/configuration") {
+    sendJson(response, 200, {
+      manager: appConfig.manager,
+      roles: appConfig.roles,
+      configured: appConfig.configured,
+      activeRunIds: organization.state().activeRunIds,
+    });
+    return;
+  }
+
+  if (request.method === "PUT" && url.pathname === "/api/configuration/assignments") {
+    try {
+      const payload = await readJsonBody(request);
+      const state = applyAssignmentConfiguration(payload);
+      sendJson(response, 200, {
+        manager: appConfig.manager,
+        roles: appConfig.roles,
+        activeRunIds: state.activeRunIds,
+        appliesTo: "next-physical-invocation",
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/configuration/adapters") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { agent: addCustomAdapter(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
     return;
   }
 

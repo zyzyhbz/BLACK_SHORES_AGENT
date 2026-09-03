@@ -28,7 +28,13 @@ const DEFAULT_CONFIG = {
     requiredTests: [],
   },
   adapters: {
-    codex: { enabled: true, command: "", model: "", reasoningEffort: "" },
+    codex: {
+      enabled: true,
+      command: "",
+      model: "",
+      models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"],
+      reasoningEffort: "",
+    },
     cursor: { enabled: true, command: "", model: "auto", reasoningEffort: "model-default" },
     zcode: { enabled: true, node: "", script: "", model: "", reasoningEffort: "" },
     grok: { enabled: true, command: "", model: "", reasoningEffort: "default" },

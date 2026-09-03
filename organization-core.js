@@ -662,12 +662,53 @@ class OrganizationService {
     };
   }
 
+  setAssignments({ managerAssignment, roleAssignments = {} }) {
+    if (!managerAssignment?.adapterId) {
+      throw Object.assign(new Error("总管 AGENT 任职缺少适配器"), { statusCode: 400 });
+    }
+    this.managerAssignment = { ...managerAssignment };
+    this.roleAssignments = Object.fromEntries(
+      Object.entries(roleAssignments).map(([roleId, assignment]) => [
+        roleId,
+        { ...this.managerAssignment, ...assignment },
+      ]),
+    );
+    this.ledger.append("agent_assignments.updated", {
+      actorRoleId: "human-owner",
+      payload: {
+        manager: {
+          adapterId: this.managerAssignment.adapterId,
+          model: this.managerAssignment.model,
+          reasoningEffort: this.managerAssignment.reasoningEffort,
+        },
+        roles: Object.fromEntries(
+          Object.entries(this.roleAssignments).map(([roleId, assignment]) => [
+            roleId,
+            {
+              adapterId: assignment.adapterId,
+              model: assignment.model,
+              reasoningEffort: assignment.reasoningEffort,
+            },
+          ]),
+        ),
+        activeRunIds: [...this.activeRuns.values()].map((run) => run.runId),
+        appliesTo: "next-physical-invocation",
+      },
+    });
+    return this.state();
+  }
+
   mission(missionId) {
     return this.state().missions.find((mission) => mission.id === missionId) || null;
   }
 
   _assignmentForRole(roleId) {
-    return { ...this.managerAssignment, ...(this.roleAssignments[roleId] || {}) };
+    const inherited = !Object.hasOwn(this.roleAssignments, roleId);
+    return {
+      ...this.managerAssignment,
+      ...(this.roleAssignments[roleId] || {}),
+      inherited,
+    };
   }
 
   createMission(goal, workflowProfile = "auto") {

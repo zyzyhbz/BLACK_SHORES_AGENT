@@ -38,11 +38,13 @@ let activeView = "workbench";
 let selectedMissionId = "";
 let organizationState = null;
 let healthState = null;
+let configurationState = null;
 let ledgerEvents = [];
 let loading = true;
 let requestInFlight = false;
 let toastTimer = null;
 let pollTimer = null;
+let assignmentDraft = null;
 const commandDrafts = new Map();
 const commandSelections = new Map();
 
@@ -592,18 +594,132 @@ function renderLedger() {
     </section>`;
 }
 
+function configuredAgent(adapterId) {
+  const agents = Object.values(healthState?.agents || {});
+  if (adapterId === "auto") return agents.find((agent) => agent.connected) || null;
+  return healthState?.agents?.[adapterId] || null;
+}
+
+function adapterOptions(selected) {
+  const agents = Object.values(healthState?.agents || {});
+  const autoReady = agents.some((agent) => agent.connected);
+  return [
+    `<option value="auto" ${selected === "auto" ? "selected" : ""} ${autoReady ? "" : "disabled"}>自动选择</option>`,
+    ...agents.map((agent) => {
+      const unavailable = agent.connected ? "" : "（不可用）";
+      return `<option value="${escapeHtml(agent.id)}" ${selected === agent.id ? "selected" : ""} ${agent.connected || selected === agent.id ? "" : "disabled"}>${escapeHtml(agent.label)}${unavailable}</option>`;
+    }),
+  ].join("");
+}
+
+function reasoningOptions(agent, model, selected) {
+  const supplied = agent?.reasoningByModel?.[model] || agent?.reasoningOptions || [];
+  const options = [...new Set([selected, ...supplied].filter(Boolean))];
+  return [
+    `<option value="" ${selected ? "" : "selected"}>本地默认</option>`,
+    ...options
+    .map((value) => `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(value)}</option>`)
+  ].join("");
+}
+
+function modelOptions(agent) {
+  return (agent?.modelOptions || [])
+    .map((model) => `<option value="${escapeHtml(model)}"></option>`)
+    .join("");
+}
+
+function assignmentRow({ key, label, subtitle, assignment, effective, inherited = false }) {
+  const selectedAdapter = assignment?.adapter || assignment?.adapterId || effective?.adapterId || "auto";
+  const agent = configuredAgent(selectedAdapter);
+  const model = assignment?.model ?? effective?.model ?? agent?.model ?? "";
+  const reasoning = assignment?.reasoningEffort ?? effective?.reasoningEffort ?? agent?.reasoningEffort ?? "";
+  const disabled = inherited ? "disabled" : "";
+  const listId = `models-${key}`;
+  return `
+    <div class="assignment-row" data-assignment-key="${escapeHtml(key)}">
+      <div class="assignment-role">
+        <strong>${escapeHtml(label)}</strong>
+        <small>${escapeHtml(subtitle || (inherited ? "继承总管任职" : "独立任职"))}</small>
+      </div>
+      <label class="field-label">
+        <span>适配器</span>
+        <select data-assignment-field="adapter" ${disabled}>${adapterOptions(selectedAdapter)}</select>
+      </label>
+      <label class="field-label">
+        <span>模型</span>
+        <input type="text" data-assignment-field="model" list="${listId}" value="${escapeHtml(model)}" placeholder="本地默认" ${disabled} />
+        <datalist id="${listId}">${modelOptions(agent)}</datalist>
+      </label>
+      <label class="field-label">
+        <span>推理强度</span>
+        <select data-assignment-field="reasoningEffort" ${disabled}>${reasoningOptions(agent, model, reasoning)}</select>
+      </label>
+      ${key === "manager" ? '<span class="assignment-scope">组织默认</span>' : `<label class="inherit-toggle"><input type="checkbox" data-assignment-inherit ${inherited ? "checked" : ""} /><span>继承总管</span></label>`}
+    </div>`;
+}
+
+function currentAssignmentData() {
+  if (assignmentDraft) return assignmentDraft;
+  return {
+    manager: configurationState?.manager || {},
+    roles: configurationState?.roles || {},
+  };
+}
+
+function renderAssignmentConsole() {
+  const data = currentAssignmentData();
+  const managerEffective = organizationState?.authority || {};
+  const managerRow = assignmentRow({
+    key: "manager",
+    label: "总管 AGENT",
+    subtitle: "全部未单独任职角色的默认配置",
+    assignment: data.manager,
+    effective: {
+      adapterId: managerEffective.managerAdapter,
+      model: managerEffective.managerModel,
+      reasoningEffort: managerEffective.managerReasoning,
+    },
+  });
+  const roleRows = (organizationState?.roles || []).map((role) => {
+    const hasOverride = Object.hasOwn(data.roles || {}, role.id) && data.roles[role.id]?.inherit !== true;
+    return assignmentRow({
+      key: role.id,
+      label: role.name,
+      subtitle: hasOverride ? `${role.id} · 独立任职` : `${role.id} · 继承总管`,
+      assignment: hasOverride ? data.roles[role.id] : data.manager,
+      effective: organizationState?.roleAssignments?.[role.id],
+      inherited: !hasOverride,
+    });
+  }).join("");
+  return `
+    <section class="assignment-console" aria-labelledby="assignmentTitle">
+      <header class="subsection-heading">
+        <div><span class="section-kicker">运行时任职</span><h3 id="assignmentTitle">角色模型与推理强度</h3></div>
+        <button type="button" class="button button-primary" data-action="save-assignments" ${requestInFlight ? "disabled" : ""}>${icon("save")}保存任职</button>
+      </header>
+      <form id="assignmentForm">
+        <div class="assignment-list assignment-manager">${managerRow}</div>
+        <div class="assignment-list">
+          <div class="assignment-list-title"><strong>角色覆盖</strong><span>关闭继承后可单独任职</span></div>
+          ${roleRows}
+        </div>
+      </form>
+    </section>`;
+}
+
 function renderResources() {
   const agents = healthState?.agents || {};
   const authority = organizationState?.authority || {};
   return `
     <section class="page-section">
-      <header class="section-heading"><div><span class="section-kicker">管理诊断入口</span><h2>AGENT 资源</h2></div><span class="resource-policy">模型厂商不限，由本地配置任职</span></header>
+      <header class="section-heading"><div><span class="section-kicker">管理诊断入口</span><h2>AGENT 资源</h2></div><div class="section-actions"><span class="resource-policy">模型厂商不限</span><button type="button" class="button button-secondary" data-action="new-agent">${icon("plus")}新增 AGENT</button></div></header>
       <div class="manager-assignment">
         <div>${icon("crown")}<span><small>当前总管任职</small><strong>${escapeHtml(managerSummary())}</strong></span></div>
         <div><span>角色</span><strong>总管 AGENT</strong></div>
         <div><span>适配器</span><strong>${escapeHtml(authority.managerAdapterLabel || authority.managerAdapter || "未配置")}</strong></div>
         <div><span>降级策略</span><strong>失败即阻塞，不静默降级</strong></div>
       </div>
+      ${renderAssignmentConsole()}
       <div class="resource-table">
         <div class="table-head"><span>资源</span><span>连接</span><span>默认模型</span><span>权限模式</span></div>
         ${Object.values(agents)
@@ -622,6 +738,187 @@ function renderLoading() {
 
 function renderError(message) {
   return `<div class="error-state">${icon("triangle-alert")}<div><strong>组织工作台无法读取</strong><p>${escapeHtml(message)}</p><button type="button" class="button button-secondary" data-action="refresh">重试</button></div></div>`;
+}
+
+function assignmentValue(row) {
+  return {
+    adapter: row.querySelector('[data-assignment-field="adapter"]')?.value || "auto",
+    model: row.querySelector('[data-assignment-field="model"]')?.value.trim() || "",
+    reasoningEffort:
+      row.querySelector('[data-assignment-field="reasoningEffort"]')?.value || "",
+  };
+}
+
+function captureAssignmentDraft() {
+  const form = document.getElementById("assignmentForm");
+  if (!form) return;
+  const managerRow = form.querySelector('[data-assignment-key="manager"]');
+  const roles = {};
+  form.querySelectorAll("[data-assignment-key]").forEach((row) => {
+    const key = row.dataset.assignmentKey;
+    if (key === "manager") return;
+    roles[key] = row.querySelector("[data-assignment-inherit]")?.checked
+      ? { inherit: true }
+      : assignmentValue(row);
+  });
+  assignmentDraft = { manager: assignmentValue(managerRow), roles };
+}
+
+function syncAssignmentRow(row, { resetModel = false, resetReasoning = false } = {}) {
+  const adapterSelect = row.querySelector('[data-assignment-field="adapter"]');
+  const modelInput = row.querySelector('[data-assignment-field="model"]');
+  const reasoningSelect = row.querySelector('[data-assignment-field="reasoningEffort"]');
+  const datalist = row.querySelector("datalist");
+  const agent = configuredAgent(adapterSelect?.value);
+  if (resetModel && modelInput) modelInput.value = agent?.model || "";
+  if (datalist) datalist.innerHTML = modelOptions(agent);
+  if (reasoningSelect) {
+    const current = resetModel || resetReasoning
+      ? agent?.reasoningDefaultsByModel?.[modelInput?.value] || agent?.reasoningEffort || ""
+      : reasoningSelect.value;
+    reasoningSelect.innerHTML = reasoningOptions(agent, modelInput?.value || "", current);
+  }
+  captureAssignmentDraft();
+}
+
+function syncInheritedRowsFromManager() {
+  const form = document.getElementById("assignmentForm");
+  const managerRow = form?.querySelector('[data-assignment-key="manager"]');
+  if (!managerRow) return;
+  const manager = assignmentValue(managerRow);
+  form.querySelectorAll('[data-assignment-key]:not([data-assignment-key="manager"])').forEach((row) => {
+    if (!row.querySelector("[data-assignment-inherit]")?.checked) return;
+    row.querySelector('[data-assignment-field="adapter"]').value = manager.adapter;
+    row.querySelector('[data-assignment-field="model"]').value = manager.model;
+    syncAssignmentRow(row);
+    row.querySelector('[data-assignment-field="reasoningEffort"]').value = manager.reasoningEffort;
+  });
+  captureAssignmentDraft();
+}
+
+function bindAssignmentEvents() {
+  const form = document.getElementById("assignmentForm");
+  if (!form) return;
+  form.querySelectorAll("[data-assignment-key]").forEach((row) => {
+    const isManager = row.dataset.assignmentKey === "manager";
+    const adapterSelect = row.querySelector('[data-assignment-field="adapter"]');
+    const modelInput = row.querySelector('[data-assignment-field="model"]');
+    const reasoningSelect = row.querySelector('[data-assignment-field="reasoningEffort"]');
+    const inheritToggle = row.querySelector("[data-assignment-inherit]");
+
+    adapterSelect?.addEventListener("change", () => {
+      syncAssignmentRow(row, { resetModel: true });
+      if (isManager) syncInheritedRowsFromManager();
+    });
+    modelInput?.addEventListener("input", () => {
+      syncAssignmentRow(row, { resetReasoning: true });
+      if (isManager) syncInheritedRowsFromManager();
+    });
+    reasoningSelect?.addEventListener("change", () => {
+      captureAssignmentDraft();
+      if (isManager) syncInheritedRowsFromManager();
+    });
+    inheritToggle?.addEventListener("change", () => {
+      const inherited = inheritToggle.checked;
+      row.querySelectorAll("[data-assignment-field]").forEach((field) => {
+        field.disabled = inherited;
+      });
+      const subtitle = row.querySelector(".assignment-role small");
+      if (subtitle) subtitle.textContent = `${row.dataset.assignmentKey} · ${inherited ? "继承总管" : "独立任职"}`;
+      if (inherited) syncInheritedRowsFromManager();
+      else captureAssignmentDraft();
+    });
+  });
+}
+
+async function saveAssignments() {
+  if (requestInFlight) return;
+  captureAssignmentDraft();
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    const result = await api("/api/configuration/assignments", {
+      method: "PUT",
+      body: JSON.stringify(assignmentDraft),
+    });
+    assignmentDraft = null;
+    showToast(
+      result.activeRunIds?.length
+        ? "任职已保存，将从下一次物理调用生效"
+        : "任职已保存并立即生效",
+    );
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+function openAgentConfigDialog() {
+  detailContent.innerHTML = `
+    <header class="dialog-header"><div><span class="section-kicker">本地适配器</span><h2>接入新 AGENT</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭" title="关闭">${icon("x")}</button></header>
+    <form class="agent-config-form" id="agentConfigForm">
+      <div class="form-grid">
+        <label class="field-label"><span>AGENT ID</span><input type="text" name="id" pattern="[a-z0-9][a-z0-9-]{1,62}" placeholder="my-agent" required /></label>
+        <label class="field-label"><span>显示名称</span><input type="text" name="label" placeholder="My AGENT" required /></label>
+        <label class="field-label form-span"><span>可执行命令</span><input type="text" name="command" placeholder="命令名或绝对路径" required /></label>
+        <label class="field-label"><span>模型 ID</span><input type="text" name="model" placeholder="provider/model" required /></label>
+        <label class="field-label"><span>推理强度</span><input type="text" name="reasoningEffort" value="default" required /></label>
+        <label class="field-label form-span"><span>参数模板（JSON 数组）</span><textarea name="args" rows="4" spellcheck="false">[]</textarea></label>
+        <label class="field-label"><span>提示词输入</span><select name="promptMode"><option value="stdin">标准输入</option><option value="argument">参数 {prompt}</option></select></label>
+        <label class="field-label"><span>输出格式</span><select name="outputFormat"><option value="text">纯文本</option><option value="ndjson">逐行 JSON</option></select></label>
+      </div>
+      <label class="check-line"><input type="checkbox" name="skipVersionCheck" /><span>跳过 --version 检查</span></label>
+      <footer class="dialog-actions"><button type="button" class="button button-secondary" data-close-dialog>取消</button><button type="submit" class="button button-primary">${icon("plug")}接入 AGENT</button></footer>
+    </form>`;
+  detailDialog.showModal();
+  detailContent.querySelectorAll("[data-close-dialog]").forEach((button) => {
+    button.addEventListener("click", () => detailDialog.close());
+  });
+  document.getElementById("agentConfigForm")?.addEventListener("submit", submitAgentConfig);
+  refreshIcons();
+}
+
+async function submitAgentConfig(event) {
+  event.preventDefault();
+  if (requestInFlight) return;
+  const form = new FormData(event.currentTarget);
+  let args;
+  try {
+    args = JSON.parse(form.get("args") || "[]");
+    if (!Array.isArray(args)) throw new Error("必须是数组");
+  } catch (error) {
+    showToast(`参数模板无效：${error.message}`, "danger");
+    return;
+  }
+  requestInFlight = true;
+  try {
+    const result = await api("/api/configuration/adapters", {
+      method: "POST",
+      body: JSON.stringify({
+        id: form.get("id"),
+        label: form.get("label"),
+        command: form.get("command"),
+        model: form.get("model"),
+        reasoningEffort: form.get("reasoningEffort"),
+        args,
+        promptMode: form.get("promptMode"),
+        outputFormat: form.get("outputFormat"),
+        skipVersionCheck: form.get("skipVersionCheck") === "on",
+      }),
+    });
+    detailDialog.close();
+    assignmentDraft = null;
+    showToast(result.agent.connected ? "AGENT 已接入，可以分配角色" : "配置已保存，但命令尚不可用", result.agent.connected ? "success" : "danger");
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
 }
 
 function captureEditorFocus() {
@@ -690,14 +987,16 @@ async function refreshState({ quiet = false } = {}) {
   if (!quiet) loading = true;
   if (!quiet) renderCurrentView();
   try {
-    const [state, health, ledger] = await Promise.all([
+    const [state, health, ledger, configuration] = await Promise.all([
       api("/api/organization/state"),
       api("/api/health"),
       api("/api/organization/events"),
+      api("/api/configuration"),
     ]);
     organizationState = state;
     healthState = health;
     ledgerEvents = ledger.events || [];
+    configurationState = configuration;
     if (!selectedMissionId && state.missions?.length) selectedMissionId = state.missions[0].id;
     systemState.classList.remove("offline");
     systemState.innerHTML = '<span class="system-state-dot" aria-hidden="true"></span>组织在线';
@@ -826,6 +1125,7 @@ function openEventDetail(eventId) {
 
 function bindDynamicEvents() {
   document.getElementById("commandForm")?.addEventListener("submit", submitCommand);
+  bindAssignmentEvents();
   const responseEditor = document.getElementById("commandInput");
   responseEditor?.addEventListener("input", (event) => {
     commandDrafts.set(commandKey(), event.currentTarget.value);
@@ -843,6 +1143,8 @@ function bindDynamicEvents() {
       }
       else if (action === "request-baseline-change") document.getElementById("commandInput")?.focus();
       else if (action === "refresh") refreshState();
+      else if (action === "save-assignments") saveAssignments();
+      else if (action === "new-agent") openAgentConfigDialog();
       else missionAction(action);
     });
   });
