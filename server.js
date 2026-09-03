@@ -20,6 +20,7 @@ const STATIC_FILES = new Map([
   ["/index.html", ["index.html", "text/html; charset=utf-8"]],
   ["/black-coast.css", ["black-coast.css", "text/css; charset=utf-8"]],
   ["/black-coast-app.js", ["black-coast-app.js", "text/javascript; charset=utf-8"]],
+  ["/vendor/lucide.min.js", ["vendor/lucide.min.js", "text/javascript; charset=utf-8"]],
 ]);
 
 function existingFile(filePath) {
@@ -742,7 +743,7 @@ async function readJsonBody(request) {
   }
 }
 
-function stopProcessTree(child) {
+function stopProcessTree(child, { escalate = false } = {}) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === "win32" && child.pid) {
     spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
@@ -751,9 +752,29 @@ function stopProcessTree(child) {
     });
     return;
   }
-  child.kill("SIGTERM");
+  const signal = escalate ? "SIGKILL" : "SIGTERM";
+  if (child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+    }
+  }
+  child.kill(signal);
 }
 
+const ALLOWED_ORIGINS = new Set(
+  [PORT, 4782].map((port) => `http://127.0.0.1:${port}`),
+);
+
+function requestFromWorkbench(request) {
+  const host = request.headers.host || "";
+  if (!ALLOWED_ORIGINS.has(`http://${host}`)) return false;
+  const origin = request.headers.origin;
+  if (origin === undefined || origin === "") return true;
+  if (request.method === "GET") return true;
+  return ALLOWED_ORIGINS.has(origin);
+}
 function stripAnsi(value) {
   return String(value).replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "");
 }
@@ -1064,9 +1085,25 @@ async function handleAgentRun(request, response, adapter) {
       cwd: workingDirectory,
       env: { ...process.env, ...childEnv },
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  const runTimeoutMs = Number.parseInt(
+    process.env.BLACK_SHORES_RUN_TIMEOUT_MS || String(45 * 60_000),
+    10,
+  );
+  const runTimer =
+    runTimeoutMs > 0
+      ? setTimeout(() => {
+          writeEvent(response, {
+            type: "hub.error",
+            message: `组织 Run 超过 ${Math.round(runTimeoutMs / 60_000)} 分钟未完成，已终止`,
+          });
+          stopProcessTree(child, { escalate: true });
+        }, runTimeoutMs)
+      : null;
+  runTimer?.unref?.();
   const state = {
     sessionId: "",
     thinking: false,
@@ -1117,6 +1154,7 @@ async function handleAgentRun(request, response, adapter) {
 
   child.on("error", (error) => {
     completed = true;
+    clearTimeout(runTimer);
     activeExclusiveRuns.delete(adapter.id);
     writeEvent(response, { type: "hub.error", message: error.message });
     if (!response.writableEnded && !response.destroyed) response.end();
@@ -1124,6 +1162,7 @@ async function handleAgentRun(request, response, adapter) {
 
   child.on("close", (code, signal) => {
     completed = true;
+    clearTimeout(runTimer);
     activeExclusiveRuns.delete(adapter.id);
     if (adapter.outputFormat !== "text" && stdoutBuffer.trim()) processLine(stdoutBuffer);
     if (!abortedByClient && code !== 0) {
@@ -1176,6 +1215,7 @@ function runAdapterBuffered(
         cwd: workingDirectory,
         env: { ...process.env, ...childEnv },
         windowsHide: true,
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
@@ -1192,10 +1232,23 @@ function runAdapterBuffered(
     let stdoutBuffer = "";
     let stderrBuffer = "";
     let settled = false;
+    const runTimeoutMs = Number.parseInt(
+      process.env.BLACK_SHORES_RUN_TIMEOUT_MS || String(45 * 60_000),
+      10,
+    );
+    const runTimer =
+      runTimeoutMs > 0
+        ? setTimeout(() => {
+            stderrBuffer = `${stderrBuffer}\n组织 Run 超过 ${Math.round(runTimeoutMs / 60_000)} 分钟未完成，已终止`.trim();
+            stopProcessTree(child, { escalate: true });
+          }, runTimeoutMs)
+        : null;
+    runTimer?.unref?.();
 
     function finish(error, value) {
       if (settled) return;
       settled = true;
+      clearTimeout(runTimer);
       activeExclusiveRuns.delete(adapter.id);
       if (error) reject(error);
       else resolve(value);
@@ -1379,6 +1432,11 @@ function serveStatic(response, pathname) {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || HOST}`);
 
+  if (!requestFromWorkbench(request)) {
+    sendJson(response, 403, { error: "拒绝跨站请求：请从 http://127.0.0.1 的工作台访问" });
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/health") {
     const publicAdapters = Object.fromEntries(
       Object.entries(adapters).map(([id, adapter]) => [id, publicAdapter(adapter)]),
@@ -1412,10 +1470,17 @@ const server = http.createServer(async (request, response) => {
 
   if (request.method === "GET" && url.pathname === "/api/organization/events") {
     const missionId = url.searchParams.get("missionId");
-    const events = organizationLedger
-      .events()
-      .filter((event) => !missionId || event.missionId === missionId);
-    sendJson(response, 200, { events });
+    const since = url.searchParams.get("since");
+    try {
+      let events = organizationLedger.eventsSince(since);
+      if (missionId) events = events.filter((event) => event.missionId === missionId);
+      sendJson(response, 200, {
+        events,
+        cursor: organizationLedger.latestEventId(),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
     return;
   }
 

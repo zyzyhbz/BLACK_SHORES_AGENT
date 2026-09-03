@@ -64,6 +64,21 @@ test("role JSON accepts fenced output and rejects prose-only output", () => {
   assert.deepEqual(extractJsonObject("```json\n{\"ok\":true}\n```"), { ok: true });
   assert.throws(() => extractJsonObject("没有结构化结果"), /不包含可读取/);
 });
+test("role JSON survives prose wrapping, braces in prose and trailing objects", () => {
+  assert.deepEqual(
+    extractJsonObject('好的，结果如下：{"ok":true,"note":"包含 } 和 { 的字符串"}，以上。'),
+    { ok: true, note: "包含 } 和 { 的字符串" },
+  );
+  assert.deepEqual(
+    extractJsonObject('{"verdict":"pass"}\n{"verdict":"fail"}'),
+    { verdict: "pass" },
+  );
+  assert.deepEqual(
+    extractJsonObject('结论：\n```\n{"ok":false}\n```'),
+    { ok: false },
+  );
+  assert.throws(() => extractJsonObject('说明 {"a":1 但缺少闭合'), /不包含可读取/);
+});
 
 test("mission creation fails closed when no AGENT assignment is available", () => {
   const { directory, ledger } = tempLedger();
@@ -597,6 +612,29 @@ test("natural-language command bus records commands and controls workflow profil
   assert.equal(ledger.events().filter((event) => event.type === "command.executed").length, 2);
 });
 
+
+test("mission state stays consistent across incremental ledger appends", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    managerAssignment: {
+      adapterId: "test",
+      ready: true,
+    },
+    runRole: async () => ({ output: "{}" }),
+  });
+  assert.equal(service.state().missions.length, 0);
+  const mission = service.createMission("处理一个已经描述清楚的任务");
+  assert.equal(service.state().missions.length, 1);
+  assert.equal(mission.status, "clarifying");
+  ledger.append("mission.status_changed", {
+    missionId: mission.id,
+    payload: { from: "clarifying", to: "planning", reason: "外部追加验证" },
+  });
+  assert.equal(service.mission(mission.id).status, "planning");
+  assert.equal(service.state().ledger.eventCount, ledger.events().length);
+});
 test("auto workflow profile explains deterministic light and heavy selections", async () => {
   const first = tempLedger();
   const lightService = new OrganizationService({ ledger: first.ledger, project: project(first.directory), runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }) });

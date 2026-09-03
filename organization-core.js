@@ -244,6 +244,19 @@ class JsonlLedger {
   events() {
     return this._events.map((event) => ({ ...event, payload: { ...event.payload } }));
   }
+
+  eventsSince(cursorId) {
+    if (!cursorId) return this.events();
+    const index = this._events.findLastIndex((event) => event.id === cursorId);
+    if (index === -1) {
+      throw Object.assign(new Error(`未知的事件游标：${cursorId}`), { statusCode: 400 });
+    }
+    return this.events().slice(index + 1);
+  }
+
+  latestEventId() {
+    return this._events.at(-1)?.id || null;
+  }
 }
 
 function emptyMission(event) {
@@ -278,8 +291,7 @@ function emptyMission(event) {
   };
 }
 
-function reduceLedger(events) {
-  const missions = new Map();
+function reduceLedgerCore(events, missions = new Map()) {
   for (const event of events) {
     if (event.type === "mission.created") {
       missions.set(event.missionId, emptyMission(event));
@@ -434,16 +446,47 @@ function reduceLedger(events) {
   return [...missions.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
+function reduceLedger(events) {
+  return reduceLedgerCore(events);
+}
+
+function firstBalancedJsonObject(source) {
+  const start = source.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  return null;
+}
+
 function extractJsonObject(text) {
   const source = normalizeText(text, 200_000);
-  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-  const candidate = fenced || source.slice(source.indexOf("{"), source.lastIndexOf("}") + 1);
-  if (!candidate || !candidate.startsWith("{") || !candidate.endsWith("}")) {
-    throw new Error("角色输出不包含可读取的 JSON 对象");
+  const candidates = [source, source.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1], firstBalancedJsonObject(source)];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate.trim());
+      assertObject(parsed, "角色输出");
+      return parsed;
+    } catch {
+    }
   }
-  const parsed = JSON.parse(candidate);
-  assertObject(parsed, "角色输出");
-  return parsed;
+  throw new Error("角色输出不包含可读取的 JSON 对象");
 }
 
 function renderRoleContract(roleId) {
@@ -620,11 +663,28 @@ class OrganizationService {
     this.maxRecoveryAttempts = maxRecoveryAttempts;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.activeRuns = new Map();
+    this._missions = [];
+    this._reducedEventCount = 0;
+    this._refreshMissions();
     this._recoverInterruptedRuns();
   }
 
+  _refreshMissions() {
+    const events = this.ledger.events();
+    if (events.length === this._reducedEventCount) return this._missions;
+    if (events.length < this._reducedEventCount) {
+      this._missions = reduceLedger(events);
+    } else {
+      const missionsMap = new Map(this._missions.map((mission) => [mission.id, mission]));
+      reduceLedgerCore(events.slice(this._reducedEventCount), missionsMap);
+      this._missions = [...missionsMap.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    }
+    this._reducedEventCount = events.length;
+    return this._missions;
+  }
+
   state() {
-    const missions = reduceLedger(this.ledger.events());
+    const missions = this._refreshMissions();
     return {
       version: SYSTEM_VERSION,
       productName: "黑海岸 AGENT 系统",
@@ -658,7 +718,7 @@ class OrganizationService {
         lastCheckpoint: active.lastCheckpoint,
         resumed: active.resumed === true,
       })),
-      ledger: { path: this.ledger.filePath, eventCount: this.ledger.events().length },
+      ledger: { path: this.ledger.filePath, eventCount: this._reducedEventCount },
     };
   }
 

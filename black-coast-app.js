@@ -39,6 +39,8 @@ let selectedMissionId = "";
 let organizationState = null;
 let healthState = null;
 let ledgerEvents = [];
+let ledgerCursor = null;
+let ledgerCursorReset = false;
 let loading = true;
 let requestInFlight = false;
 let toastTimer = null;
@@ -687,18 +689,27 @@ async function api(path, options = {}) {
 
 async function refreshState({ quiet = false } = {}) {
   const editorFocus = captureEditorFocus() || commandSelections.get(commandKey()) || null;
-  if (!quiet) loading = true;
-  if (!quiet) renderCurrentView();
   try {
-    const [state, health, ledger] = await Promise.all([
-      api("/api/organization/state"),
-      api("/api/health"),
-      api("/api/organization/events"),
-    ]);
-    organizationState = state;
-    healthState = health;
-    ledgerEvents = ledger.events || [];
-    if (!selectedMissionId && state.missions?.length) selectedMissionId = state.missions[0].id;
+    const since = ledgerCursorReset ? null : ledgerCursor;
+    try {
+      const [state, health, ledger] = await Promise.all([
+        api("/api/organization/state"),
+        api("/api/health"),
+        api(`/api/organization/events${since ? `?since=${encodeURIComponent(since)}` : ""}`),
+      ]);
+      if (!since) {
+        ledgerEvents = ledger.events || [];
+      } else if (ledger.events.length) {
+        ledgerEvents = [...ledgerEvents, ...ledger.events];
+      }
+      ledgerCursor = ledger.cursor || null;
+      ledgerCursorReset = false;
+      organizationState = state;
+      healthState = health;
+    } catch (error) {
+      if (since && /未知的事件游标/.test(error.message)) ledgerCursorReset = true;
+      throw error;
+    }
     systemState.classList.remove("offline");
     systemState.innerHTML = '<span class="system-state-dot" aria-hidden="true"></span>组织在线';
   } catch (error) {

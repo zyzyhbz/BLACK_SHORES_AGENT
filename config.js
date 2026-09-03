@@ -70,6 +70,26 @@ function loadConfig(rootDirectory = __dirname) {
     }
   }
 
+
+function warnUnknownKeys(localConfig, configPath) {
+  const warnings = [];
+  for (const key of Object.keys(localConfig)) {
+    if (!(key in DEFAULT_CONFIG)) warnings.push(`未知配置键 "${key}"`);
+  }
+  const builtinAdapters = Object.keys(DEFAULT_CONFIG.adapters);
+  for (const key of Object.keys(localConfig.adapters || {})) {
+    if (key !== "custom" && !(key in DEFAULT_CONFIG.adapters)) {
+      warnings.push(
+        `未知适配器配置 "${key}"（内置适配器：${builtinAdapters.join(", ")}；其他厂商请使用 custom 列表）`,
+      );
+    }
+  }
+  for (const warning of warnings) {
+    console.warn(`BLACK_SHORES_AGENT 配置警告（${path.basename(configPath)}）：${warning}`);
+  }
+}
+
+  warnUnknownKeys(localConfig, configPath);
   const config = mergeConfig(DEFAULT_CONFIG, localConfig);
   const baseDirectory = path.dirname(configPath);
   config.configPath = configPath;

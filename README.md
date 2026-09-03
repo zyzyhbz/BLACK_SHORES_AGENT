@@ -128,4 +128,4 @@ node --check organization-core.js
 node --check black-coast-app.js
 ```
 
-当前 MVP 使用 Node.js 标准库，无需安装运行时依赖。
+当前 MVP 使用 Node.js 标准库，无需安装运行时依赖。工作台图标库 lucide 已随仓库本地化在 `vendor/`，离线环境同样可用。

@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -23,7 +24,7 @@ function allocatePort() {
   });
 }
 
-async function startServer({ ledgerPath, worktree, manager, adapters }) {
+async function startServer({ ledgerPath, worktree, manager, adapters, extraEnv = {} }) {
   const port = await allocatePort();
   const configPath = path.join(path.dirname(ledgerPath), "black-shores.config.json");
   fs.writeFileSync(
@@ -56,6 +57,7 @@ async function startServer({ ledgerPath, worktree, manager, adapters }) {
       ...process.env,
       BLACK_SHORES_PORT: String(port),
       BLACK_SHORES_CONFIG: configPath,
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -125,9 +127,6 @@ test("HTTP surface serves the workbench and rejects invalid mission input", asyn
   });
   assert.equal(commandResponse.status, 202);
   assert.equal((await commandResponse.json()).action, "query_status");
-  const serverSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
-  assert.doesNotMatch(serverSource, /组织 Run 超过.*分钟/);
-  assert.doesNotMatch(serverSource, /timeoutMs\s*=\s*45\s*\*/);
   assert.equal((await fetch(`${server.origin}/missing`)).status, 404);
 });
 
@@ -219,4 +218,136 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   assert.equal(mission.runs[0].adapterId, "vendor-agent");
   assert.equal(mission.runs[0].model, "vendor/model-x");
   assert.match(mission.messages.at(-1).content, /验收环境/);
+});
+
+test("cross-site state-changing requests are rejected while same-origin workbench requests pass", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({
+    ledgerPath: path.join(directory, "ledger.jsonl"),
+    worktree: directory,
+  });
+  context.after(() => stopServer(server.child));
+
+  const evilOrigin = "https://attacker.example";
+
+  const forged = await fetch(`${server.origin}/api/organization/missions`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain", Origin: evilOrigin },
+    body: JSON.stringify({ goal: "跨站页面诱导的恶意目标文本" }),
+  });
+  assert.equal(forged.status, 403);
+  // 非浏览器客户端（curl、脚本）不带 Origin，仍可用；浏览器跨站请求必带 Origin。
+  // 无 Origin 的浏览器向量化身只有 DNS rebinding，由 Host 校验拦截。
+  const noOriginClient = await fetch(`${server.origin}/api/organization/missions`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ goal: "非浏览器脚本客户端的合法请求" }),
+  });
+  assert.notEqual(noOriginClient.status, 403);
+
+  const dnsRebinding = await new Promise((resolve) => {
+    const { hostname, port } = new URL(server.origin);
+    const request = http.request(
+      { host: hostname, port, method: "GET", path: "/api/organization/state", headers: { Host: "evil.example" } },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.end();
+  });
+  assert.equal(dnsRebinding, 403);
+
+  const health = await fetch(`${server.origin}/api/health`);
+  assert.equal(health.status, 200);
+
+  const sameOrigin = await fetch(`${server.origin}/api/organization/commands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: server.origin },
+    body: JSON.stringify({ content: "查看当前任务状态" }),
+  });
+  assert.equal(sameOrigin.status, 202);
+  assert.equal((await sameOrigin.json()).action, "query_status");
+});
+
+test("an organization run that hangs past the configured timeout is terminated", async (context) => {
+  const directory = tempDirectory();
+  const worktree = path.join(directory, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  const runScript = path.join(directory, "hang.js");
+  fs.writeFileSync(runScript, "setInterval(() => {}, 1000);\n");
+  const server = await startServer({
+    ledgerPath: path.join(directory, "ledger.jsonl"),
+    worktree,
+    extraEnv: { BLACK_SHORES_RUN_TIMEOUT_MS: "1500" },
+    adapters: {
+      codex: { enabled: false },
+      cursor: { enabled: false },
+      zcode: { enabled: false },
+      grok: { enabled: false },
+      custom: [
+        {
+          id: "hang",
+          label: "Hanging agent",
+          enabled: true,
+          command: process.execPath,
+          args: [runScript, "--cwd", "{cwd}"],
+          promptMode: "stdin",
+          outputFormat: "text",
+          skipVersionCheck: true,
+        },
+      ],
+    },
+  });
+  context.after(() => stopServer(server.child));
+
+  const response = await fetch(`${server.origin}/api/agents/hang/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: server.origin },
+    body: JSON.stringify({ prompt: "挂住的超时验证", cwd: worktree }),
+  });
+  assert.equal(response.status, 200);
+  const lines = [];
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    lines.push(...decoder.decode(value).trim().split("\n").filter(Boolean));
+    if (lines.at(-1)?.includes("hub.exit")) break;
+  }
+  reader.cancel().catch(() => {});
+  const events = lines.map((line) => JSON.parse(line));
+  assert.ok(events.some((event) => event.type === "hub.error" && /分钟未完成/.test(event.message)));
+  assert.ok(events.some((event) => event.type === "hub.exit"));
+});
+
+test("event feed supports incremental since cursor fetches", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({
+    ledgerPath: path.join(directory, "ledger.jsonl"),
+    worktree: directory,
+  });
+  context.after(() => stopServer(server.child));
+
+  const command = await fetch(`${server.origin}/api/organization/commands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: server.origin },
+    body: JSON.stringify({ content: "查看当前任务状态" }),
+  });
+  assert.equal(command.status, 202);
+
+  const full = await (await fetch(`${server.origin}/api/organization/events`)).json();
+  assert.ok(Array.isArray(full.events));
+  assert.ok(full.events.length > 0);
+  assert.equal(full.cursor, full.events.at(-1).id);
+
+  const since = full.events[0].id;
+  const incremental = await (await fetch(`${server.origin}/api/organization/events?since=${encodeURIComponent(since)}`)).json();
+  assert.equal(incremental.events.length, full.events.length - 1);
+  assert.deepEqual(incremental.events.map((event) => event.id), full.events.slice(1).map((event) => event.id));
+
+  const badCursor = await fetch(`${server.origin}/api/organization/events?since=evt-nonexistent`);
+  assert.equal(badCursor.status, 400);
 });
