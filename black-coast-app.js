@@ -28,7 +28,7 @@ const statusMeta = {
   awaiting_external_evidence: ["待外部证据", "decision"],
   awaiting_result_acceptance: ["待结果验收", "decision"],
   blocked: ["已阻塞", "danger"],
-  waiting: ["外部等待", "waiting"],
+  waiting: ["已安全暂停", "waiting"],
   accepted: ["已验收", "success"],
   failed: ["已失败", "danger"],
   cancelled: ["已取消", "neutral"],
@@ -351,7 +351,7 @@ function renderBaseline(mission) {
       </div>
       <div class="decision-actions">
         <button type="button" class="button button-secondary" data-action="request-baseline-change">补充或修正</button>
-        <button type="button" class="button button-primary" data-action="confirm-baseline" ${requestInFlight ? "disabled" : ""}>
+        <button type="button" class="button button-primary" data-action="confirm-baseline" ${requestInFlight || !missionActionAvailable(mission, "confirm-baseline") ? "disabled" : ""}>
           ${icon("check")}
           <span>确认需求基线</span>
         </button>
@@ -370,8 +370,10 @@ function renderResponseComposer(mission) {
   const placeholder = ["clarifying", "awaiting_baseline_confirmation"].includes(mission.status)
     ? "回答需求明确岗，或输入“使用轻度模式”“确认需求基线”。"
     : mission.status === "blocked"
-      ? "输入“恢复任务”或查询当前状态。"
-      : "输入命令，例如“查看当前任务状态”或“开始重度全量回顾”。";
+      ? "描述要修改的需求，或点击上方“恢复任务”。"
+      : mission.status === "waiting"
+        ? "输入中途修改要求，或点击上方“继续运行”。"
+        : "输入命令，例如“查看当前任务状态”或“开始重度全量回顾”。";
   return `${blockerBar}
     <form class="response-composer command-composer" id="commandForm">
       <label for="commandInput">命令总线 · ${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</label>
@@ -387,6 +389,10 @@ function candidateApproval(mission, kind) {
       approval.candidateId === mission.releaseCandidate?.id &&
       approval.candidateDigest === mission.releaseCandidate?.digest,
   );
+}
+
+function missionActionAvailable(mission, action) {
+  return Array.isArray(mission?.availableActions) && mission.availableActions.includes(action);
 }
 
 function shortCommit(value) {
@@ -406,35 +412,35 @@ function renderReleaseGate(mission) {
     action = `
       <div class="gate-action">
         <div><strong>核对候选来源</strong><small>系统将同步远端并校验分支、提交、工作树与项目配置指纹。</small></div>
-        <button type="button" class="button button-primary" data-action="verify-source" ${requestInFlight ? "disabled" : ""}>${icon("scan-search")}核对来源</button>
+        <button type="button" class="button button-primary" data-action="verify-source" ${requestInFlight || !missionActionAvailable(mission, "verify-source") ? "disabled" : ""}>${icon("scan-search")}核对来源</button>
       </div>`;
   } else if (mission.status === "awaiting_release_approval" && !mergeApproval) {
     action = `
       <div class="gate-action gate-warning">
         <div><strong>合并授权</strong><small>只授权合并当前指纹候选，不包含部署。</small></div>
-        <button type="button" class="button button-primary" data-action="approve-merge" ${requestInFlight ? "disabled" : ""}>${icon("git-merge")}批准合并</button>
+        <button type="button" class="button button-primary" data-action="approve-merge" ${requestInFlight || !missionActionAvailable(mission, "approve-merge") ? "disabled" : ""}>${icon("git-merge")}批准合并</button>
       </div>`;
   } else if (mission.status === "awaiting_release_approval" && !deploymentApproval) {
     action = `
       <div class="gate-action gate-warning">
         <div><strong>部署授权</strong><small>合并授权已记录；本动作只授权部署当前候选。</small></div>
-        <button type="button" class="button button-primary" data-action="approve-deployment" ${requestInFlight ? "disabled" : ""}>${icon("upload-cloud")}批准部署</button>
+        <button type="button" class="button button-primary" data-action="approve-deployment" ${requestInFlight || !missionActionAvailable(mission, "approve-deployment") ? "disabled" : ""}>${icon("upload-cloud")}批准部署</button>
       </div>`;
   } else if (mission.status === "awaiting_external_evidence") {
     action = `
-      <form class="external-evidence-form" id="externalEvidenceForm">
+      <form class="external-evidence-form" id="externalEvidenceForm" aria-disabled="${!missionActionAvailable(mission, "external-evidence")}">
         <label for="buildIdentity">候选身份</label>
         <input id="buildIdentity" name="buildIdentity" maxlength="500" placeholder="版本号、部署时间或构建 ID" required />
         <fieldset class="result-segment"><legend>外部验收结果</legend><label><input type="radio" name="result" value="passed" required /><span>${icon("check")}通过</span></label><label><input type="radio" name="result" value="failed" required /><span>${icon("x")}失败</span></label></fieldset>
         <label for="externalNotes">证据摘要</label>
         <textarea id="externalNotes" name="notes" rows="3" maxlength="6000" placeholder="环境、步骤、观察结果与证据路径"></textarea>
-        <button type="submit" class="button button-primary" ${requestInFlight ? "disabled" : ""}>${icon("clipboard-check")}提交外部证据</button>
+        <button type="submit" class="button button-primary" ${requestInFlight || !missionActionAvailable(mission, "external-evidence") ? "disabled" : ""}>${icon("clipboard-check")}提交外部证据</button>
       </form>`;
   } else if (mission.status === "awaiting_result_acceptance") {
     action = `
       <div class="gate-action gate-success">
         <div><strong>业务结果验收</strong><small>${escapeHtml(latestExternalEvidence?.buildIdentity || "当前候选")} 的外部证据已通过。</small></div>
-        <button type="button" class="button button-primary" data-action="accept-result" ${requestInFlight ? "disabled" : ""}>${icon("badge-check")}验收结果</button>
+        <button type="button" class="button button-primary" data-action="accept-result" ${requestInFlight || !missionActionAvailable(mission, "accept-result") ? "disabled" : ""}>${icon("badge-check")}验收结果</button>
       </div>`;
   } else if (mission.status === "accepted") {
     action = `<div class="gate-action gate-success"><div><strong>Mission 已验收</strong><small>发布授权、外部证据和结果验收均已独立留痕。</small></div>${icon("badge-check")}</div>`;
@@ -479,15 +485,53 @@ function renderWorkItems(mission) {
 }
 
 function renderRun(run) {
+  const runIcon = run.status === "running"
+    ? "loader-circle"
+    : run.status === "completed"
+      ? "check"
+      : run.status === "paused"
+        ? "pause"
+        : "x";
   const activity = run.status === "running"
     ? run.currentAction || run.lastCheckpoint?.summary || "角色正在执行"
     : `${run.invocations?.length || 1} 次物理调用`;
   return `
     <div class="run-row">
-      <span class="run-icon">${icon(run.status === "running" ? "loader-circle" : run.status === "completed" ? "check" : "x", run.status === "running" ? "spin" : "")}</span>
+      <span class="run-icon">${icon(runIcon, run.status === "running" ? "spin" : "")}</span>
       <div><strong>${escapeHtml(run.roleName)}</strong><small>${escapeHtml(activity)} · ${formatTime(run.lastHeartbeatAt || run.at)}</small></div>
       <span class="run-status">${escapeHtml(run.status)}</span>
     </div>`;
+}
+
+function renderMissionControls(mission) {
+  const active = organizationState?.activeRuns?.find((run) => run.missionId === mission.id);
+  const profileEditable = missionActionAvailable(mission, "workflow-profile");
+  const profile = mission.workflowProfile?.requested || "auto";
+  const profileButtons = [
+    ["auto", "自动"],
+    ["light", "轻度"],
+    ["heavy", "重度"],
+  ].map(([value, label]) => `
+    <button type="button" class="segment-button ${profile === value ? "active" : ""}" data-workflow-profile="${value}" ${!profileEditable || requestInFlight ? "disabled" : ""}>${label}</button>`).join("");
+  const pauseLabel = active?.pauseRequested
+    ? "正在安全暂停"
+    : mission.status === "waiting"
+      ? "已安全暂停"
+      : "安全暂停";
+  const pauseButton = `<button type="button" class="button button-danger" data-action="pause" ${requestInFlight || !missionActionAvailable(mission, "pause") || active?.pauseRequested ? "disabled" : ""}>${icon(active?.pauseRequested ? "loader-circle" : "pause", active?.pauseRequested ? "spin" : "")} ${pauseLabel}</button>`;
+  let contextualActions = "";
+  if (mission.status === "waiting") {
+    contextualActions = `<button type="button" class="button button-secondary" data-action="request-revision" ${requestInFlight || !missionActionAvailable(mission, "revise-requirements") ? "disabled" : ""}>${icon("pencil-line")}修改需求</button><button type="button" class="button button-primary" data-action="resume" ${requestInFlight || !missionActionAvailable(mission, "resume") ? "disabled" : ""}>${icon("play")}继续运行</button>`;
+  } else if (mission.status === "blocked") {
+    contextualActions = `<button type="button" class="button button-secondary" data-action="request-revision" ${requestInFlight || !missionActionAvailable(mission, "revise-requirements") ? "disabled" : ""}>${icon("pencil-line")}修改需求</button><button type="button" class="button button-primary" data-action="retry" ${requestInFlight || !missionActionAvailable(mission, "retry") ? "disabled" : ""}>${icon("rotate-ccw")}恢复任务</button>`;
+  } else if (mission.status === "light_completed") {
+    contextualActions = `<button type="button" class="button button-primary" data-action="start-heavy-review" ${requestInFlight || !missionActionAvailable(mission, "start-heavy-review") ? "disabled" : ""}>${icon("shield-check")}启动重度全量回顾</button>`;
+  }
+  return `
+    <section class="mission-controls" aria-label="Mission 控制">
+      <div class="workflow-control"><span>工作模式</span><div class="segmented-control" aria-label="工作流模式">${profileButtons}</div><small>${escapeHtml(mission.workflowProfile?.reason || "")}</small></div>
+      <div class="mission-control-actions">${contextualActions}${pauseButton}</div>
+    </section>`;
 }
 
 function renderActiveRun(mission) {
@@ -495,7 +539,7 @@ function renderActiveRun(mission) {
   if (!active) return "";
   return `
     <section class="inspector-section activity-section">
-      <header><span>活动 Run</span><span class="live-indicator"><i></i>运行中</span></header>
+      <header><span>活动 Run</span><span class="live-indicator"><i></i>${active.pauseRequested ? "暂停中" : "运行中"}</span></header>
       <div class="activity-line"><span>当前动作</span><strong>${escapeHtml(active.currentAction || "正在建立执行上下文")}</strong></div>
       <div class="activity-line"><span>物理调用</span><code>${escapeHtml(active.invocationId || "—")}</code></div>
       <div class="activity-line"><span>最后心跳</span><time>${formatTime(active.lastHeartbeatAt)}</time></div>
@@ -517,6 +561,7 @@ function renderMissionWorkbench(mission) {
           <div class="mission-header-state"><span class="workflow-profile">${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</span>${statusPill(mission.status)}</div>
         </header>
         <div class="mission-progress" aria-label="Mission 进度"><span style="width:${progress}%"></span></div>
+        ${renderMissionControls(mission)}
         <div class="conversation-stream">
           ${mission.messages.map(renderMessage).join("") || '<div class="quiet-empty">尚无消息</div>'}
         </div>
@@ -565,7 +610,7 @@ function renderMissions() {
     <section class="page-section">
       <header class="section-heading">
         <div><span class="section-kicker">业务结果容器</span><h2>Mission</h2></div>
-        <button type="button" class="button button-primary" data-action="new-mission" ${missions.some((item) => !["light_completed", "accepted", "failed", "cancelled", "superseded"].includes(item.status)) ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
+        <button type="button" class="button button-primary" data-action="new-mission" ${organizationState?.controls?.canCreateMission === false ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
       </header>
       <div class="mission-table">
         <div class="table-head"><span>Mission</span><span>状态</span><span>责任阶段</span><span>更新时间</span><span></span></div>
@@ -625,6 +670,9 @@ function eventLabel(event) {
     "run.started": "启动 Run",
     "run.completed": "完成 Run",
     "run.failed": "Run 失败",
+    "run.pause_requested": "请求安全暂停",
+    "run.paused": "暂停 Run",
+    "run.resume_requested": "恢复 Run",
     "run.output_rejected": "拒绝不合约输出",
     "run.heartbeat": "记录 Run 心跳",
     "run.checkpointed": "保存进度检查点",
@@ -633,6 +681,7 @@ function eventLabel(event) {
     "physical_invocation.failed": "物理调用失败",
     "physical_invocation.interrupted": "物理调用中断",
     "workflow_profile.selected": "选择工作流档位",
+    "requirements_revision.requested": "记录中途需求修改",
     "baseline.drafted": "生成基线草案",
     "baseline.confirmed": "确认需求基线",
     "charter.created": "建立任务章程",
@@ -1322,12 +1371,21 @@ async function missionAction(action) {
   requestInFlight = true;
   renderCurrentView();
   try {
-    if (action === "confirm-baseline") {
+    if (action === "pause") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/pause`, { method: "POST" });
+      showToast("安全暂停请求已下达，正在保存现场");
+    } else if (action === "resume") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/resume`, { method: "POST" });
+      showToast("已从最近检查点继续运行");
+    } else if (action === "confirm-baseline") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/confirm-baseline`, { method: "POST" });
       showToast("需求基线已确认，群星的调律者开始组织规划");
     } else if (action === "retry") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/retry`, { method: "POST" });
       showToast("已在恢复预算内重新任职");
+    } else if (action === "start-heavy-review") {
+      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/start-heavy-review`, { method: "POST" });
+      showToast("重度全量回顾已启动");
     } else if (action === "verify-source") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/verify-source`, { method: "POST" });
       showToast("候选来源已核对并生成固定指纹");
@@ -1341,6 +1399,26 @@ async function missionAction(action) {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/accept-result`, { method: "POST" });
       showToast("业务结果已验收，Mission 完成");
     }
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+async function setWorkflowProfile(profile) {
+  const mission = activeMission();
+  if (!mission || requestInFlight) return;
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/workflow-profile`, {
+      method: "POST",
+      body: JSON.stringify({ profile }),
+    });
+    showToast(`工作模式已设为${{ auto: "自动", light: "轻度", heavy: "重度" }[profile] || profile}`);
     await refreshState({ quiet: true });
   } catch (error) {
     showToast(error.message, "danger");
@@ -1380,12 +1458,15 @@ function bindDynamicEvents() {
         selectedMissionId = "__new__";
         switchView("workbench");
       }
-      else if (action === "request-baseline-change") document.getElementById("commandInput")?.focus();
+      else if (["request-baseline-change", "request-revision"].includes(action)) document.getElementById("commandInput")?.focus();
       else if (action === "refresh") refreshState();
       else if (action === "save-assignments") saveAssignments();
       else if (action === "new-agent") openAgentConfigDialog();
       else missionAction(action);
     });
+  });
+  mainContent.querySelectorAll("[data-workflow-profile]").forEach((button) => {
+    button.addEventListener("click", () => setWorkflowProfile(button.dataset.workflowProfile));
   });
   mainContent.querySelectorAll("[data-mission-id]").forEach((button) => {
     button.addEventListener("click", () => {

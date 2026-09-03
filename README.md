@@ -22,7 +22,7 @@ npm test
 npm start
 ```
 
-打开 `http://127.0.0.1:4782/`。Windows 也可以运行 `start-black-shores-agent.cmd`，macOS/Linux 可以运行 `./start-black-shores-agent.sh`。
+打开 `http://127.0.0.1:4782/`。Windows 可以运行 `start-black-shores-agent.cmd`；该入口会调用已安装的隐藏计划任务，未安装计划任务时则启动与当前终端分离的隐藏后台进程。macOS/Linux 可以运行 `./start-black-shores-agent.sh`。
 
 Windows 需要静默常驻和登录自启时运行：
 
@@ -30,7 +30,7 @@ Windows 需要静默常驻和登录自启时运行：
 powershell -ExecutionPolicy Bypass -File .\install-windows-autostart.ps1
 ```
 
-该脚本注册当前用户的 `BLACK_SHORES_AGENT` 计划任务。服务窗口保持隐藏，异常退出后自动重启，运行日志写入本机 `data/service.*.log`。
+该脚本注册当前用户的 `BLACK_SHORES_AGENT` 计划任务。服务窗口保持隐藏，异常退出后自动重启，并由每分钟守护触发器补偿前台进程被关闭等情况；运行日志写入本机 `data/service.*.log`。
 
 `npm run setup` 会创建仅保存在本机的 `black-shores.config.json`。该文件、`data/` 账本、日志和环境变量文件都已加入 `.gitignore`。
 
@@ -122,6 +122,8 @@ powershell -ExecutionPolicy Bypass -File .\install-windows-autostart.ps1
 - `light`：需求明确岗 -> 群星的调律者 -> 工程执行岗 -> 独立复核岗。完成后记录 `ChangeRecord`，不宣称已经完成全量功能验证。
 - `heavy`：在完整分工与独立复核后，由测试岗执行项目的全部必跑测试，形成 `VerifiedBaseline` 和发布候选。
 - `auto`：根据目标中的风险、发布、部署、权限、迁移和全量回归信号确定轻度或重度模式。
+
+工作台为所有面向人类的 Mission 动作提供明确入口：工作模式切换、需求基线确认、活动 Run 安全暂停、从检查点继续、阻塞恢复、中途修改需求、轻度结果转重度回顾，以及完整发布门禁。安全暂停会终止当前物理调用，但保留同一个逻辑 Run 和最近检查点；继续时不会把已完成动作伪装成新动作。
 
 重度模式的必跑项来自项目自己的 `testManifest.requiredTests`。任一必跑项缺失或失败，发布候选不会通过。
 

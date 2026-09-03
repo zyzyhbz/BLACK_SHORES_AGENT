@@ -679,6 +679,144 @@ test("global tuner context stays independent from a blocked Mission", async () =
   assert.ok(tunerRequests.every((event) => event.missionId === null));
 });
 
+test("safe pause preserves the logical run and resume creates a new physical invocation", async () => {
+  const { directory, ledger } = tempLedger();
+  let invocationCount = 0;
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => {
+      invocationCount += 1;
+      if (invocationCount === 1) {
+        await new Promise((resolve, reject) => {
+          const stop = () => reject(Object.assign(new Error("paused by owner"), { code: "SAFE_PAUSE" }));
+          if (signal.aborted) stop();
+          else signal.addEventListener("abort", stop, { once: true });
+        });
+      }
+      return {
+        output: JSON.stringify({
+          readyForBaseline: false,
+          message: "已从暂停检查点继续需求整理",
+          questions: [],
+        }),
+      };
+    },
+  });
+
+  const mission = service.createMission("验证活动任务能够安全暂停并继续运行");
+  const firstTask = service.activeRuns.get(mission.id).task;
+  const paused = service.executeCommand({
+    content: "安全暂停任务",
+    channel: "tuner-chat",
+    context: "global",
+  });
+  assert.equal(paused.action, "pause_requested");
+  assert.equal(paused.mission.id, mission.id);
+  await firstTask;
+
+  const waiting = service.mission(mission.id);
+  assert.equal(waiting.status, "waiting");
+  assert.equal(waiting.blockers.length, 0);
+  assert.equal(waiting.runs.length, 1);
+  assert.equal(waiting.runs[0].status, "paused");
+  assert.equal(waiting.runs[0].invocations[0].status, "interrupted");
+
+  const resumed = service.resumePaused(mission.id);
+  assert.equal(resumed.runs.length, 1);
+  await settle(service);
+  const completed = service.mission(mission.id);
+  assert.equal(completed.status, "clarifying");
+  assert.equal(completed.runs.length, 1);
+  assert.equal(completed.runs[0].status, "completed");
+  assert.equal(completed.runs[0].invocations.length, 2);
+  assert.equal(completed.runs[0].invocations[1].resumed, true);
+  assert.equal(ledger.events().filter((event) => event.type === "run.pause_requested").length, 1);
+  assert.equal(ledger.events().filter((event) => event.type === "run.paused").length, 1);
+  assert.equal(ledger.events().filter((event) => event.type === "run.resume_requested").length, 1);
+});
+
+test("a paused Mission can return to requirements clarification with a new instruction", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-paused-revision",
+    payload: { title: "暂停中的任务", goal: "实现一个需要中途修改的完整功能", workflowProfile: "light" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-paused-revision",
+    payload: { from: "intake", to: "clarifying", reason: "开始澄清" },
+  });
+  ledger.append("run.started", {
+    missionId: "mission-paused-revision",
+    actorRoleId: "requirements-lead",
+    payload: { runId: "run-paused", roleId: "requirements-lead", roleName: "需求明确岗" },
+  });
+  ledger.append("run.paused", {
+    missionId: "mission-paused-revision",
+    actorRoleId: "requirements-lead",
+    payload: { runId: "run-paused", reason: "人类请求安全暂停" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-paused-revision",
+    payload: { from: "clarifying", to: "waiting", reason: "等待修改" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: JSON.stringify({ readyForBaseline: false, message: "已按新要求重新整理", questions: [] }),
+    }),
+  });
+
+  const revised = service.executeCommand({
+    content: "调整需求：保留现有数据并缩小改动范围",
+    missionId: "mission-paused-revision",
+  });
+  assert.equal(revised.action, "revise_requirements");
+  assert.equal(revised.mission.status, "clarifying");
+  assert.equal(ledger.events().filter((event) => event.type === "requirements_revision.requested").length, 1);
+  await settle(service);
+  assert.match(service.mission("mission-paused-revision").messages.at(-1).content, /新要求/);
+});
+
+test("available actions disable unrelated Mission controls while another Run is active", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-release-waiting",
+    payload: { title: "待验收任务", goal: "验证跨 Mission 控制隔离保持一致", workflowProfile: "heavy" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-release-waiting",
+    payload: { from: "intake", to: "awaiting_result_acceptance", reason: "等待验收" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      const stop = () => reject(Object.assign(new Error("paused"), { code: "SAFE_PAUSE" }));
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
+    }),
+  });
+  const activeMission = service.createMission("启动另一个持续运行的任务用于验证控制隔离");
+  const activeTask = service.activeRuns.get(activeMission.id).task;
+
+  const state = service.state();
+  assert.equal(state.controls.canCreateMission, false);
+  assert.deepEqual(
+    state.missions.find((mission) => mission.id === "mission-release-waiting").availableActions,
+    ["query-status"],
+  );
+  assert.ok(state.missions.find((mission) => mission.id === activeMission.id).availableActions.includes("pause"));
+  assert.throws(
+    () => service.acceptResult("mission-release-waiting"),
+    /另一个 Mission 正在执行/,
+  );
+
+  service.requestSafePause(activeMission.id);
+  await activeTask;
+});
+
 test("auto workflow profile explains deterministic light and heavy selections", async () => {
   const first = tempLedger();
   const lightService = new OrganizationService({ ledger: first.ledger, project: project(first.directory), runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }) });

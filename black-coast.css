@@ -866,6 +866,11 @@ input::placeholder {
   border-color: var(--red);
 }
 
+.button-danger:hover:not(:disabled) {
+  background: #a92f43;
+  border-color: #a92f43;
+}
+
 .operating-baseline {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1009,6 +1014,79 @@ input::placeholder {
   height: 100%;
   background: var(--accent);
   transition: width 220ms ease;
+}
+
+.mission-controls {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: -10px 0 20px;
+  padding: 10px 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-control {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-control > span {
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.workflow-control > small {
+  width: 100%;
+  color: var(--ink-faint);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.segmented-control {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 52px);
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+}
+
+.segment-button {
+  width: 52px;
+  height: 30px;
+  padding: 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 650;
+  background: var(--surface);
+  border: 0;
+  border-right: 1px solid var(--line-strong);
+  cursor: pointer;
+}
+
+.segment-button:last-child {
+  border-right: 0;
+}
+
+.segment-button.active {
+  color: #ffffff;
+  background: var(--accent);
+}
+
+.segment-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.mission-control-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
 }
 
 .conversation-stream {
@@ -2541,12 +2619,26 @@ input::placeholder {
 
   .composer-footer,
   .mission-header,
+  .mission-controls,
   .section-heading,
   .subsection-heading,
   .gate-action,
   .blocker-bar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .mission-controls {
+    align-items: stretch;
+  }
+
+  .mission-control-actions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+
+  .mission-control-actions .button {
+    width: 100%;
   }
 
   .composer-footer .button,

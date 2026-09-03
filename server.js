@@ -1318,8 +1318,10 @@ async function handleAgentRun(request, response, adapter) {
 
 function runAdapterBuffered(
   adapter,
-  { prompt, cwd, model, reasoningEffort, onActivity },
+  { prompt, cwd, model, reasoningEffort, onActivity, signal },
 ) {
+  const pauseError = () => Object.assign(new Error("人类请求安全暂停"), { code: "SAFE_PAUSE" });
+  if (signal?.aborted) return Promise.reject(pauseError());
   if (!adapter.connected) return Promise.reject(new Error(adapter.message));
   const workingDirectory = path.resolve(cwd);
   try {
@@ -1366,14 +1368,26 @@ function runAdapterBuffered(
     let stdoutBuffer = "";
     let stderrBuffer = "";
     let settled = false;
+    let interruption = null;
 
     function finish(error, value) {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", handleAbort);
       activeExclusiveRuns.delete(adapter.id);
       if (error) reject(error);
       else resolve(value);
     }
+
+    function handleAbort() {
+      if (settled || interruption) return;
+      interruption = pauseError();
+      onActivity?.({ type: "hub.progress", message: "正在终止物理调用并保存暂停现场" });
+      stopProcessTree(child);
+    }
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    if (signal?.aborted) handleAbort();
 
     function processLine(line) {
       const cleanLine = stripAnsi(line).trim();
@@ -1413,8 +1427,12 @@ function runAdapterBuffered(
     child.stderr.on("data", (chunk) => {
       stderrBuffer = `${stderrBuffer}${stripAnsi(chunk)}`.slice(-20_000);
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) => finish(interruption || error));
     child.on("close", (code, signal) => {
+      if (interruption) {
+        finish(interruption);
+        return;
+      }
       if (adapter.outputFormat !== "text" && stdoutBuffer.trim()) processLine(stdoutBuffer);
       const output = (adapter.outputFormat === "text" ? stdoutBuffer : resultParts.join("")).trim();
       if (code !== 0 || !output) {
@@ -1438,8 +1456,10 @@ function runAdapterBuffered(
       });
     });
 
-    if (adapter.promptViaStdin) child.stdin.end(prompt, "utf8");
-    else child.stdin.end();
+    if (!interruption) {
+      if (adapter.promptViaStdin) child.stdin.end(prompt, "utf8");
+      else child.stdin.end();
+    }
   });
 }
 
@@ -1480,6 +1500,7 @@ const organization = new OrganizationService({
     runId,
     invocationId,
     onActivity,
+    signal,
   }) => {
     const adapter = adapters[adapterId];
     if (!adapter) throw new Error(`未知 AGENT 适配器：${adapterId}`);
@@ -1503,10 +1524,11 @@ const organization = new OrganizationService({
         model,
         reasoningEffort,
         onActivity,
+        signal,
       });
     } catch (error) {
       runtimeGovernance.complete(action, {
-        status: "failed",
+        status: error.code === "SAFE_PAUSE" ? "interrupted" : "failed",
         error: error.message || String(error),
       });
       throw error;
@@ -1766,7 +1788,7 @@ const server = http.createServer(async (request, response) => {
   }
 
   const missionActionMatch = url.pathname.match(
-    /^\/api\/organization\/missions\/([^/]+)\/(messages|confirm-baseline|retry|verify-source|approve-merge|approve-deployment|external-evidence|accept-result)$/,
+    /^\/api\/organization\/missions\/([^/]+)\/(messages|workflow-profile|pause|resume|revise-requirements|confirm-baseline|retry|start-heavy-review|verify-source|approve-merge|approve-deployment|external-evidence|accept-result)$/,
   );
   if (request.method === "POST" && missionActionMatch) {
     const missionId = decodeURIComponent(missionActionMatch[1]);
@@ -1775,10 +1797,22 @@ const server = http.createServer(async (request, response) => {
       if (action === "messages") {
         const payload = await readJsonBody(request);
         sendJson(response, 202, { mission: organization.addHumanMessage(missionId, payload.content) });
+      } else if (action === "workflow-profile") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 200, { mission: organization.setWorkflowProfile(missionId, payload.profile) });
+      } else if (action === "pause") {
+        sendJson(response, 202, { mission: organization.requestSafePause(missionId), pauseRequested: true });
+      } else if (action === "resume") {
+        sendJson(response, 202, { mission: organization.resumePaused(missionId) });
+      } else if (action === "revise-requirements") {
+        const payload = await readJsonBody(request);
+        sendJson(response, 202, { mission: organization.reviseRequirements(missionId, payload.content) });
       } else if (action === "confirm-baseline") {
         sendJson(response, 202, { mission: organization.confirmBaseline(missionId) });
       } else if (action === "retry") {
         sendJson(response, 202, { mission: organization.retry(missionId) });
+      } else if (action === "start-heavy-review") {
+        sendJson(response, 202, { mission: organization.startHeavyReview(missionId) });
       } else if (action === "verify-source") {
         const source = inspectReleaseSource(organizationProject);
         sendJson(response, 200, { mission: organization.verifyReleaseSource(missionId, source) });

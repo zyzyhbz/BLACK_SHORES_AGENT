@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
 
-const SYSTEM_VERSION = "0.7.1-mvp";
+const SYSTEM_VERSION = "0.8.0-mvp";
 const PROJECT_ID = "project-default";
 const MANAGER_MODEL = "configured-model";
 const MANAGER_REASONING = "model-default";
@@ -12,12 +12,12 @@ const WORKFLOW_PROFILES = new Set(["auto", "light", "heavy"]);
 
 const ALLOWED_STATUS_TRANSITIONS = new Map([
   ["intake", new Set(["clarifying", "cancelled"])],
-  ["clarifying", new Set(["clarifying", "awaiting_baseline_confirmation", "blocked", "cancelled"])],
-  ["awaiting_baseline_confirmation", new Set(["clarifying", "planning", "blocked", "cancelled"])],
-  ["planning", new Set(["executing", "blocked", "cancelled"])],
-  ["executing", new Set(["awaiting_review", "blocked", "cancelled"])],
-  ["awaiting_review", new Set(["executing", "testing", "light_completed", "blocked", "cancelled"])],
-  ["testing", new Set(["executing", "release_candidate_ready", "blocked", "cancelled"])],
+  ["clarifying", new Set(["clarifying", "awaiting_baseline_confirmation", "waiting", "blocked", "cancelled"])],
+  ["awaiting_baseline_confirmation", new Set(["clarifying", "planning", "waiting", "blocked", "cancelled"])],
+  ["planning", new Set(["executing", "waiting", "blocked", "cancelled"])],
+  ["executing", new Set(["awaiting_review", "waiting", "blocked", "cancelled"])],
+  ["awaiting_review", new Set(["executing", "testing", "light_completed", "waiting", "blocked", "cancelled"])],
+  ["testing", new Set(["executing", "release_candidate_ready", "waiting", "blocked", "cancelled"])],
   ["release_candidate_ready", new Set(["awaiting_release_approval", "blocked", "cancelled"])],
   ["awaiting_release_approval", new Set(["awaiting_release_approval", "awaiting_external_evidence", "blocked", "cancelled"])],
   ["awaiting_external_evidence", new Set(["executing", "awaiting_result_acceptance", "blocked", "cancelled"])],
@@ -175,6 +175,9 @@ function commandReply(action, mission, missions = []) {
     set_workflow_profile: "工作流档位已更新。",
     confirm_baseline: "需求基线已确认，群星的调律者开始建立任务章程。",
     retry_blocked: "已按恢复预算启动续作。",
+    pause_requested: "安全暂停请求已下达；系统正在保存现场并停止本次物理调用。",
+    resume_paused: "已从最近检查点恢复同一逻辑 Run。",
+    revise_requirements: "修改要求已记录，Mission 已回到需求明确岗重新整理基线。",
     start_heavy_review: "重度全量回顾已启动。",
   };
   return replies[action] || "命令已执行。";
@@ -340,6 +343,7 @@ function reduceLedger(events) {
         const run = mission.runs.find((item) => item.id === event.payload.runId);
         if (run) {
           run.status = "running";
+          run.pauseRequested = false;
           run.invocations.push({ id: event.payload.invocationId, at: event.at, status: "running", ...event.payload });
           run.currentInvocationId = event.payload.invocationId;
         }
@@ -359,6 +363,21 @@ function reduceLedger(events) {
       case "run.heartbeat": {
         const run = mission.runs.find((item) => item.id === event.payload.runId);
         if (run) Object.assign(run, { lastHeartbeatAt: event.at, currentAction: event.payload.currentAction || run.currentAction });
+        break;
+      }
+      case "run.pause_requested": {
+        const run = mission.runs.find((item) => item.id === event.payload.runId);
+        if (run) Object.assign(run, { pauseRequested: true, pauseRequestedAt: event.at, currentAction: event.payload.reason || "正在安全暂停" });
+        break;
+      }
+      case "run.paused": {
+        const run = mission.runs.find((item) => item.id === event.payload.runId);
+        if (run) Object.assign(run, event.payload, { status: "paused", pauseRequested: false, pausedAt: event.at });
+        break;
+      }
+      case "run.resume_requested": {
+        const run = mission.runs.find((item) => item.id === event.payload.runId);
+        if (run) Object.assign(run, { pauseRequested: false, resumeRequestedAt: event.at });
         break;
       }
       case "run.checkpointed": {
@@ -671,7 +690,14 @@ class OrganizationService {
       project: this.project,
       projectTestManifest: this.projectTestManifest,
       roles: ROLE_DEFINITIONS,
-      missions: missions.map(publicMission),
+      missions: missions.map((mission) => ({
+        ...publicMission(mission),
+        availableActions: this._availableActions(mission),
+      })),
+      controls: {
+        canCreateMission: this.activeRuns.size === 0,
+        directAgentInvocation: "internal-diagnostic-only",
+      },
       activeRunIds: [...this.activeRuns.keys()],
       activeRuns: [...this.activeRuns.entries()].map(([missionId, active]) => ({
         missionId,
@@ -684,6 +710,7 @@ class OrganizationService {
         lastCheckpointAt: active.lastCheckpointAt,
         lastCheckpoint: active.lastCheckpoint,
         resumed: active.resumed === true,
+        pauseRequested: active.pauseRequested === true,
       })),
       ledger: { path: this.ledger.filePath, eventCount: this.ledger.events().length },
     };
@@ -729,6 +756,38 @@ class OrganizationService {
     return this.state().missions.find((mission) => mission.id === missionId) || null;
   }
 
+  _availableActions(mission) {
+    const actions = ["query-status"];
+    const active = this.activeRuns.has(mission.id);
+    const anotherMissionActive = [...this.activeRuns.keys()].some((missionId) => missionId !== mission.id);
+    if (!anotherMissionActive && ["clarifying", "awaiting_baseline_confirmation", "waiting", "light_completed"].includes(mission.status)) {
+      actions.push("workflow-profile");
+    }
+    if (active) actions.push("pause");
+    if (!anotherMissionActive && mission.status === "waiting" && mission.runs.some((run) => run.status === "paused")) {
+      actions.push("resume", "revise-requirements");
+    }
+    if (!active && !anotherMissionActive && mission.status === "blocked") {
+      if (mission.blockers.some((blocker) => blocker.status === "open")) actions.push("retry");
+      actions.push("revise-requirements");
+    }
+    if (!active && !anotherMissionActive && mission.status === "light_completed") actions.push("start-heavy-review");
+    if (!anotherMissionActive && ["clarifying", "awaiting_baseline_confirmation"].includes(mission.status)) actions.push("messages");
+    if (!anotherMissionActive && mission.status === "awaiting_baseline_confirmation" && mission.baseline) actions.push("confirm-baseline");
+    if (!anotherMissionActive && mission.status === "release_candidate_ready" && mission.releaseCandidate) actions.push("verify-source");
+    if (!anotherMissionActive && mission.status === "awaiting_release_approval" && mission.releaseCandidate?.digest) {
+      const approvals = mission.approvals.filter(
+        (approval) => approval.candidateId === mission.releaseCandidate.id
+          && approval.candidateDigest === mission.releaseCandidate.digest,
+      );
+      if (!approvals.some((approval) => approval.kind === "merge_approval")) actions.push("approve-merge");
+      else if (!approvals.some((approval) => approval.kind === "deployment_approval")) actions.push("approve-deployment");
+    }
+    if (!anotherMissionActive && mission.status === "awaiting_external_evidence") actions.push("external-evidence");
+    if (!anotherMissionActive && mission.status === "awaiting_result_acceptance") actions.push("accept-result");
+    return actions;
+  }
+
   _assignmentForRole(roleId) {
     const inherited = !Object.hasOwn(this.roleAssignments, roleId);
     return {
@@ -736,6 +795,16 @@ class OrganizationService {
       ...(this.roleAssignments[roleId] || {}),
       inherited,
     };
+  }
+
+  _assertNoOtherActiveRun(missionId) {
+    const activeMissionId = this.activeRuns.keys().next().value;
+    if (activeMissionId && activeMissionId !== missionId) {
+      throw Object.assign(
+        new Error(`另一个 Mission 正在执行，完成或安全暂停后再继续：${activeMissionId}`),
+        { statusCode: 409, missionId: activeMissionId },
+      );
+    }
   }
 
   createMission(goal, workflowProfile = "auto") {
@@ -778,10 +847,13 @@ class OrganizationService {
     if (this.activeRuns.has(missionId) && !["clarifying", "awaiting_baseline_confirmation"].includes(mission.status)) {
       throw Object.assign(new Error("活动 Run 执行中，档位变更需要先安全暂停或等待当前角色完成"), { statusCode: 409 });
     }
-    if (!["clarifying", "awaiting_baseline_confirmation", "light_completed"].includes(mission.status)) {
+    if (!["clarifying", "awaiting_baseline_confirmation", "waiting", "light_completed"].includes(mission.status)) {
       throw Object.assign(new Error(`当前状态 ${mission.status} 不能直接变更工作流档位`), { statusCode: 409 });
     }
     const profile = resolveWorkflowProfile(requested, mission.goal);
+    if (mission.status === "light_completed" && profile.resolved === "heavy") {
+      this._assertNoOtherActiveRun(missionId);
+    }
     this.ledger.append("workflow_profile.selected", {
       missionId,
       actorRoleId: "human-owner",
@@ -810,11 +882,20 @@ class OrganizationService {
     const missions = this.state().missions;
     const activeMission = missions.find((mission) => !TERMINAL_STATUSES.has(mission.status)) || null;
     const statusQuery = /^(?:查看|查询|汇报)?(?:当前)?(?:任务|Mission)?状态[？?。\s]*$/i.test(normalized);
+    const pauseRequest = /^(?:请)?(?:安全)?暂停(?:当前)?(?:任务|Mission|运行)?[。！!\s]*$/i.test(normalized);
+    const resumeRequest = /^(?:恢复|继续)(?:任务|运行|这个任务|Mission)?[。！!\s]*$/i.test(normalized);
+    const requirementRevision = /^(?:调整|修改|变更|补充|重做)(?:需求|目标|范围|验收|任务)/.test(normalized);
     const contextMode = context === "global" ? "global" : "automatic";
+    const referencedMission = missions.find((mission) => normalized.includes(mission.id)) || null;
+    const activeRunMissionIds = [...this.activeRuns.keys()];
+    const resumableMissions = missions.filter((mission) => ["waiting", "blocked"].includes(mission.status));
+    const globalActionTarget = referencedMission
+      || (pauseRequest && activeRunMissionIds.length === 1 ? this._requireMission(activeRunMissionIds[0]) : null)
+      || (resumeRequest && resumableMissions.length === 1 ? resumableMissions[0] : null);
     const selectedMission = missionId
       ? this._requireMission(missionId)
       : contextMode === "global"
-        ? null
+        ? globalActionTarget
         : activeMission || (statusQuery ? missions[0] || null : null);
     const normalizedChannel = normalizeText(channel, 80) || "local-workbench";
     this.ledger.append("command.requested", {
@@ -827,7 +908,11 @@ class OrganizationService {
       let mission;
       const profileMatch = normalized.match(/(?:使用|切换(?:为|到)?|改为|采用|设为)?\s*(轻度|重度|自动|light|heavy|auto)\s*模式/i);
       const profileMap = { 轻度: "light", 重度: "heavy", 自动: "auto", light: "light", heavy: "heavy", auto: "auto" };
-      if (/(开始|执行|安排|进入).*(重度|全量).*(回顾|验证|测试)/.test(normalized)) {
+      if (pauseRequest) {
+        if (!selectedMission) throw Object.assign(new Error("没有可安全暂停的活动 Mission"), { statusCode: 409 });
+        mission = this.requestSafePause(selectedMission.id);
+        action = "pause_requested";
+      } else if (/(开始|执行|安排|进入).*(重度|全量).*(回顾|验证|测试)/.test(normalized)) {
         if (!selectedMission) throw Object.assign(new Error("没有可进入重度回顾的 Mission"), { statusCode: 409 });
         mission = this.startHeavyReview(selectedMission.id);
         action = "start_heavy_review";
@@ -843,21 +928,32 @@ class OrganizationService {
         if (!selectedMission) throw Object.assign(new Error("没有可确认基线的 Mission"), { statusCode: 409 });
         mission = this.confirmBaseline(selectedMission.id);
         action = "confirm_baseline";
-      } else if (/^(?:恢复|继续)(?:任务|运行|这个任务)?[。！!\s]*$/.test(normalized)) {
+      } else if (resumeRequest) {
         if (!selectedMission) throw Object.assign(new Error("没有可恢复的 Mission"), { statusCode: 409 });
-        mission = this.retry(selectedMission.id);
-        action = "retry_blocked";
+        if (selectedMission.status === "waiting") {
+          mission = this.resumePaused(selectedMission.id);
+          action = "resume_paused";
+        } else {
+          mission = this.retry(selectedMission.id);
+          action = "retry_blocked";
+        }
       } else if (statusQuery) {
         mission = selectedMission;
         action = contextMode === "global" && !selectedMission
           ? "query_organization_status"
           : "query_status";
+      } else if (requirementRevision && selectedMission) {
+        mission = this.reviseRequirements(selectedMission.id, normalized);
+        action = "revise_requirements";
       } else if (!selectedMission || /^(?:新建|创建|开始)(?:一个)?(?:任务|Mission)[:：\s]/i.test(normalized)) {
         mission = this.createMission(normalized);
         action = "create_mission";
       } else if (["clarifying", "awaiting_baseline_confirmation"].includes(selectedMission.status)) {
         mission = this.addHumanMessage(selectedMission.id, normalized);
         action = "add_requirement_message";
+      } else if (["waiting", "blocked"].includes(selectedMission.status)) {
+        mission = this.reviseRequirements(selectedMission.id, normalized);
+        action = "revise_requirements";
       } else {
         throw Object.assign(new Error(`当前状态 ${selectedMission.status} 无法解释这条命令，请明确说明要查询状态、切换模式或执行门禁动作`), { statusCode: 409 });
       }
@@ -885,6 +981,7 @@ class OrganizationService {
     if (!["clarifying", "awaiting_baseline_confirmation"].includes(mission.status)) {
       throw Object.assign(new Error(`当前状态 ${mission.status} 不接受需求补充`), { statusCode: 409 });
     }
+    this._assertNoOtherActiveRun(missionId);
     const normalized = normalizeText(content, 12_000);
     if (!normalized) throw Object.assign(new Error("补充内容不能为空"), { statusCode: 400 });
     this.ledger.append("message.recorded", {
@@ -905,6 +1002,7 @@ class OrganizationService {
     if (this.activeRuns.has(missionId)) {
       throw Object.assign(new Error("Mission 已有活动 Run"), { statusCode: 409 });
     }
+    this._assertNoOtherActiveRun(missionId);
     const profile = { requested: "heavy", resolved: "heavy", reason: "人类或系统明确启动重度全量回顾" };
     this.ledger.append("workflow_profile.selected", {
       missionId,
@@ -914,11 +1012,104 @@ class OrganizationService {
     return this._startHeavyReview(missionId);
   }
 
+  requestSafePause(missionId) {
+    const mission = this._requireMission(missionId);
+    const active = this.activeRuns.get(missionId);
+    if (!active) {
+      if (mission.status === "waiting") return mission;
+      throw Object.assign(new Error("当前 Mission 没有可暂停的活动 Run"), { statusCode: 409 });
+    }
+    if (active.pauseRequested) return mission;
+    active.pauseRequested = true;
+    active.currentAction = "正在保存检查点并安全暂停";
+    this.ledger.append("run.pause_requested", {
+      missionId,
+      actorRoleId: "human-owner",
+      payload: {
+        runId: active.runId,
+        invocationId: active.invocationId,
+        reason: "人类请求安全暂停",
+        checkpointId: active.lastCheckpoint?.id || null,
+      },
+    });
+    active.abortController.abort();
+    return this.mission(missionId);
+  }
+
+  resumePaused(missionId) {
+    const mission = this._requireMission(missionId);
+    if (mission.status !== "waiting") {
+      throw Object.assign(new Error("只有已安全暂停的 Mission 可以继续运行"), { statusCode: 409 });
+    }
+    this._assertNoOtherActiveRun(missionId);
+    const pausedRun = mission.runs.findLast((run) => run.status === "paused");
+    if (!pausedRun) throw Object.assign(new Error("没有可恢复的暂停 Run"), { statusCode: 409 });
+    const previousInvocation = pausedRun.invocations?.at(-1) || null;
+    this.ledger.append("run.resume_requested", {
+      missionId,
+      actorRoleId: "human-owner",
+      payload: {
+        runId: pausedRun.id,
+        previousInvocationId: previousInvocation?.id || null,
+        checkpointId: pausedRun.lastCheckpoint?.id || null,
+      },
+    });
+    this._setStatus(missionId, this._statusForRole(pausedRun.roleId), "人类要求从最近检查点继续运行");
+    this._dispatchRole(missionId, pausedRun.roleId, {
+      runId: pausedRun.id,
+      resumed: true,
+      previousInvocationId: previousInvocation?.id || null,
+      checkpoint: pausedRun.lastCheckpoint || null,
+    });
+    return this.mission(missionId);
+  }
+
+  reviseRequirements(missionId, content) {
+    const mission = this._requireMission(missionId);
+    if (this.activeRuns.has(missionId)) {
+      throw Object.assign(new Error("请先安全暂停当前 Run，再提交中途修改"), { statusCode: 409 });
+    }
+    this._assertNoOtherActiveRun(missionId);
+    if (!["waiting", "blocked"].includes(mission.status)) {
+      throw Object.assign(new Error(`当前状态 ${mission.status} 不能回到需求明确岗`), { statusCode: 409 });
+    }
+    const normalized = normalizeText(content, 12_000);
+    if (!normalized) throw Object.assign(new Error("修改要求不能为空"), { statusCode: 400 });
+    mission.blockers
+      .filter((item) => item.status === "open")
+      .forEach((blocker) => this.ledger.append("blocker.closed", {
+        missionId,
+        actorRoleId: "human-owner",
+        payload: { id: blocker.id, resolution: "requirements_revised" },
+      }));
+    mission.workItems
+      .filter((item) => !["completed", "superseded"].includes(item.status))
+      .forEach((item) => this.ledger.append("work_item.status_changed", {
+        missionId,
+        actorRoleId: "task-owner",
+        payload: { id: item.id, status: "superseded", reason: "人类中途修改需求" },
+      }));
+    this.ledger.append("requirements_revision.requested", {
+      missionId,
+      actorRoleId: "human-owner",
+      payload: { content: normalized },
+    });
+    this.ledger.append("message.recorded", {
+      missionId,
+      actorRoleId: "human-owner",
+      payload: { authorType: "human", roleId: "human-owner", roleName: "人类负责人", content: normalized },
+    });
+    this._setStatus(missionId, "clarifying", "人类中途修改需求，需求明确岗重新整理基线");
+    this._queueRequirementRun(missionId);
+    return this.mission(missionId);
+  }
+
   confirmBaseline(missionId) {
     const mission = this._requireMission(missionId);
     if (mission.status !== "awaiting_baseline_confirmation" || !mission.baseline) {
       throw Object.assign(new Error("当前没有可确认的需求基线"), { statusCode: 409 });
     }
+    this._assertNoOtherActiveRun(missionId);
     this.ledger.append("baseline.confirmed", {
       missionId,
       actorRoleId: "human-owner",
@@ -934,6 +1125,7 @@ class OrganizationService {
     if (mission.status !== "blocked") {
       throw Object.assign(new Error("只有阻塞 Mission 可以重试"), { statusCode: 409 });
     }
+    this._assertNoOtherActiveRun(missionId);
     const openBlocker = mission.blockers.findLast((item) => item.status === "open");
     if (!openBlocker) throw Object.assign(new Error("没有开放的 BlockerCase"), { statusCode: 409 });
     const attempts = mission.blockers.filter(
@@ -966,6 +1158,7 @@ class OrganizationService {
 
   verifyReleaseSource(missionId, source) {
     const mission = this._requireMission(missionId);
+    this._assertNoOtherActiveRun(missionId);
     if (mission.status !== "release_candidate_ready" || !mission.releaseCandidate) {
       throw Object.assign(new Error("当前没有待核对来源的发布候选"), { statusCode: 409 });
     }
@@ -1019,6 +1212,7 @@ class OrganizationService {
 
   approveMerge(missionId) {
     const mission = this._requireVerifiedCandidate(missionId);
+    this._assertNoOtherActiveRun(missionId);
     if (this._candidateApproval(mission, "merge_approval")) {
       throw Object.assign(new Error("该发布候选已获得合并授权"), { statusCode: 409 });
     }
@@ -1029,6 +1223,7 @@ class OrganizationService {
 
   approveDeployment(missionId) {
     const mission = this._requireVerifiedCandidate(missionId);
+    this._assertNoOtherActiveRun(missionId);
     if (!this._candidateApproval(mission, "merge_approval")) {
       throw Object.assign(new Error("必须先单独批准合并"), { statusCode: 409 });
     }
@@ -1046,6 +1241,7 @@ class OrganizationService {
 
   recordExternalEvidence(missionId, input) {
     const mission = this._requireMission(missionId);
+    this._assertNoOtherActiveRun(missionId);
     if (mission.status !== "awaiting_external_evidence" || !mission.releaseCandidate?.digest) {
       throw Object.assign(new Error("当前不接受外部验收证据"), { statusCode: 409 });
     }
@@ -1085,6 +1281,7 @@ class OrganizationService {
 
   acceptResult(missionId) {
     const mission = this._requireMission(missionId);
+    this._assertNoOtherActiveRun(missionId);
     if (mission.status !== "awaiting_result_acceptance" || !mission.releaseCandidate?.digest) {
       throw Object.assign(new Error("当前没有可验收的业务结果"), { statusCode: 409 });
     }
@@ -1158,18 +1355,41 @@ class OrganizationService {
     for (const mission of missions) {
       if (TERMINAL_STATUSES.has(mission.status)) continue;
       const interrupted = mission.runs.findLast((run) => run.status === "running");
-      if (!interrupted) continue;
+      if (!interrupted) {
+        const latestRun = mission.runs.at(-1);
+        if (latestRun?.status === "paused" && mission.status !== "waiting") {
+          this._setStatus(mission.id, "waiting", "服务恢复了已完成的安全暂停现场");
+        }
+        continue;
+      }
       const invocation = interrupted.invocations?.findLast((item) => item.status === "running");
+      const pauseWasRequested = interrupted.pauseRequested === true;
       this.ledger.append("physical_invocation.interrupted", {
         missionId: mission.id,
         actorRoleId: "management-inspector",
         payload: {
           runId: interrupted.id,
           invocationId: invocation?.id || `${interrupted.id}-legacy-invocation`,
-          reason: "服务重启中断了物理调用，逻辑 Run 将从最近检查点续作",
+          reason: pauseWasRequested
+            ? "服务重启时完成了此前请求的安全暂停"
+            : "服务重启中断了物理调用，逻辑 Run 将从最近检查点续作",
           checkpointId: interrupted.lastCheckpoint?.id || null,
         },
       });
+      if (pauseWasRequested) {
+        this.ledger.append("run.paused", {
+          missionId: mission.id,
+          actorRoleId: "management-inspector",
+          payload: {
+            runId: interrupted.id,
+            invocationId: invocation?.id || null,
+            checkpointId: interrupted.lastCheckpoint?.id || null,
+            reason: "人类请求的安全暂停已在服务恢复时完成",
+          },
+        });
+        this._setStatus(mission.id, "waiting", "安全暂停已完成，等待人类继续或修改需求");
+        continue;
+      }
       setImmediate(() => this._dispatchRole(mission.id, interrupted.roleId, {
         runId: interrupted.id,
         resumed: true,
@@ -1600,6 +1820,7 @@ class OrganizationService {
 
   _queueRoleRun(missionId, roleId, promptBuilder, onSuccess, runOptions = {}) {
     if (this.activeRuns.has(missionId)) return;
+    this._assertNoOtherActiveRun(missionId);
     const mission = this._requireMission(missionId);
     const runId = runOptions.runId || makeId("run");
     const invocationId = makeId("invocation");
@@ -1651,6 +1872,7 @@ class OrganizationService {
       },
     });
     const startedAt = nowIso();
+    const abortController = new AbortController();
     const active = {
       runId,
       invocationId,
@@ -1661,6 +1883,8 @@ class OrganizationService {
       lastCheckpoint: runOptions.checkpoint || null,
       lastPersistedHeartbeatAt: 0,
       resumed: runOptions.resumed === true,
+      pauseRequested: false,
+      abortController,
       task: null,
     };
     this.activeRuns.set(missionId, active);
@@ -1716,6 +1940,7 @@ class OrganizationService {
         runId,
         invocationId,
         onActivity,
+        signal: abortController.signal,
       }))
       .then((result) => {
         active.roleResult = result;
@@ -1751,6 +1976,40 @@ class OrganizationService {
       })
       .catch((error) => {
         const errorMessage = normalizeText(error?.message || String(error), 12_000);
+        if (active.pauseRequested && !runCompleted) {
+          this.ledger.append("physical_invocation.interrupted", {
+            missionId,
+            actorRoleId: roleId,
+            payload: {
+              runId,
+              invocationId,
+              reason: "人类请求安全暂停，物理调用已终止",
+              checkpointId: active.lastCheckpoint?.id || null,
+            },
+          });
+          this.ledger.append("run.paused", {
+            missionId,
+            actorRoleId: roleId,
+            payload: {
+              runId,
+              invocationId,
+              checkpointId: active.lastCheckpoint?.id || null,
+              reason: errorMessage || "安全暂停",
+            },
+          });
+          this.ledger.append("message.recorded", {
+            missionId,
+            actorRoleId: "management-inspector",
+            payload: {
+              authorType: "role",
+              roleId: "management-inspector",
+              roleName: "管理巡检岗",
+              content: `${ROLE_BY_ID.get(roleId)?.name || roleId} 已安全暂停；现场和最近检查点已保留，可继续运行或修改需求。`,
+            },
+          });
+          this._setStatus(missionId, "waiting", "安全暂停已完成，等待人类继续或修改需求");
+          return;
+        }
         active.roleResult?.completeAction?.({
           status: "output_rejected",
           error: errorMessage,
