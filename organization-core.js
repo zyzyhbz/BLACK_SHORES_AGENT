@@ -159,6 +159,17 @@ function retrievalFocusFor(roleId) {
   return ROLE_RETRIEVAL_FOCUS[roleId] || ["goal", "status", "baseline"];
 }
 
+const CLARIFICATION_BUDGET_MS = 20 * 60_000;
+
+const DEFAULT_SELF_PROJECT = {
+  id: "project-black-shores",
+  name: "黑海岸 Agent 自身",
+  repository: "zyzyhbz/BLACK_SHORES_AGENT",
+  sourceRef: "origin/main",
+  workingDirectory: "D:\\BLACK_SHORES_AGENT",
+  testCommand: "npm test",
+};
+
 function makeId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 }
@@ -312,6 +323,7 @@ function emptyMission(event) {
   return {
     id: event.missionId,
     projectId: event.projectId,
+    targetProjectId: event.payload.targetProjectId || event.projectId,
     title: event.payload.title,
     goal: event.payload.goal,
     status: "intake",
@@ -702,7 +714,7 @@ function buildRequirementPrompt(mission) {
 任务事实：
 ${missionContext(mission, "requirements-lead")}
 
-请判断信息是否足以形成可交给人类确认的需求基线。按当前任务核对预期结果、范围与非范围、复现或触发条件、运行环境、约束、来源身份、已有证据、可观察验收标准和必须保留的既有行为。只询问会实质影响结果或验收的未知项，不要把诊断假设当成事实。
+请判断信息是否足以形成可交给人类确认的需求基线。按当前任务核对预期结果、范围与非范围、复现或触发条件、运行环境、约束、来源身份、已有证据、可观察验收标准和必须保留的既有行为。只询问会实质影响结果或验收的未知项，不要把诊断假设当成事实。每轮先给出已确认的结论，再列出新的问题；不要为凑数重复追问。
 
 只输出一个 JSON 对象，不要输出 Markdown 或额外文字：
 {
@@ -756,7 +768,7 @@ RequirementBaseline 已确认，任务负责人已建立 Charter。你可以在�
 任务事实：
 ${missionContext(mission, "engineering")}
 
-执行要求：先核对配置的来源基线与工作目录，建立可证伪的根因假设；按 RequirementBaseline 复现或解释环境差异；实施范围受控的根修；增加回归测试并运行与风险相称的验证。输入中的诊断只能作为待验证假设。完成后形成可定位的交付物与证据，但不要合并或部署。
+执行要求：先核对配置的来源基线与工作目录，建立可证伪的根因假设；按 RequirementBaseline 复现或解释环境差异；实施范围受控的根修；增加回归测试并运行与风险相称的验证。输入中的诊断只能作为待验证假设。每完成一个 WorkItem 先记录检查点与证据再继续，不要攒到最后一次输出。完成后形成可定位的交付物与证据，但不要合并或部署。
 
 最终只输出一个 JSON 对象：
 {"message":"阶段汇报","result":"completed|blocked","rootCause":"有证据的根因或未知","changes":["变更"],"artifacts":["绝对路径或 commit"],"tests":[{"command":"命令","result":"passed|failed","evidence":"摘要"}],"risks":["风险"],"next":"下一步"}`;
@@ -802,6 +814,7 @@ class OrganizationService {
     ledger,
     runRole,
     project,
+    projects = {},
     managerAssignment = {},
     roleAssignments = {},
     maxRecoveryAttempts = 2,
@@ -810,6 +823,11 @@ class OrganizationService {
     this.ledger = ledger;
     this.runRole = runRole;
     this.project = project;
+    this.projects = {
+      [project.id]: { ...project },
+      [DEFAULT_SELF_PROJECT.id]: { ...DEFAULT_SELF_PROJECT, ...(projects[DEFAULT_SELF_PROJECT.id] || {}) },
+      ...projects,
+    };
     this.managerAssignment = {
       adapterId: managerAssignment.adapterId || "test",
       adapterLabel: managerAssignment.adapterLabel || managerAssignment.adapterId || "Test adapter",
@@ -852,6 +870,7 @@ class OrganizationService {
         ROLE_DEFINITIONS.map((role) => [role.id, this._assignmentForRole(role.id)]),
       ),
       project: this.project,
+      projects: Object.values(this.projects),
       projectTestManifest: this.projectTestManifest,
       projectTestManifests: this.ledger.events()
         .filter((event) => event.type === "test_manifest.published")
@@ -882,6 +901,10 @@ class OrganizationService {
         invocationId: active.invocationId,
         roleId: active.roleId,
         roleName: ROLE_BY_ID.get(active.roleId)?.name || active.roleId,
+        model: active.model,
+        reasoningEffort: active.reasoningEffort,
+        scope: active.scope || [],
+        startedAt: active.startedAt,
         currentAction: active.currentAction,
         lastHeartbeatAt: active.lastHeartbeatAt,
         lastCheckpointAt: active.lastCheckpointAt,
@@ -1001,9 +1024,15 @@ class OrganizationService {
     return { id: manifestId, deprecated: true };
   }
 
+  _projectFor(mission) {
+    const target = mission?.targetProjectId || mission?.projectId;
+    return this.projects[target] || this.project;
+  }
+
   _manifestFor(mission) {
+    const projectId = mission?.targetProjectId || mission?.projectId;
     const published = this.state().projectTestManifests
-      .filter((item) => item.projectId === mission.projectId && !item.deprecated)
+      .filter((item) => item.projectId === projectId && !item.deprecated)
       .sort((left, right) => String(left.at).localeCompare(String(right.at)));
     return published.at(-1) || this.projectTestManifest;
   }
@@ -1094,7 +1123,7 @@ class OrganizationService {
     }
   }
 
-  createMission(goal, workflowProfile = "auto") {
+  createMission(goal, workflowProfile = "auto", targetProjectId = null) {
     const normalizedGoal = normalizeText(goal, 4000);
     if (normalizedGoal.length < 8) throw Object.assign(new Error("请描述一个明确的结果目标"), { statusCode: 400 });
     if (!this.managerAssignment.ready) {
@@ -1109,10 +1138,14 @@ class OrganizationService {
     }
     const missionId = makeId("mission");
     const profile = resolveWorkflowProfile(workflowProfile, normalizedGoal);
+    const target = normalizeText(targetProjectId, 200);
+    if (target && !this.projects[target]) {
+      throw Object.assign(new Error(`未知目标项目：${target}`), { statusCode: 400 });
+    }
     this.ledger.append("mission.created", {
       missionId,
       actorRoleId: "chief-manager",
-      payload: { title: normalizedGoal.slice(0, 42), goal: normalizedGoal, workflowProfile: profile.requested },
+      payload: { title: normalizedGoal.slice(0, 42), goal: normalizedGoal, workflowProfile: profile.requested, targetProjectId: target || null },
     });
     this.ledger.append("workflow_profile.selected", {
       missionId,
@@ -1162,7 +1195,7 @@ class OrganizationService {
     return this.mission(missionId);
   }
 
-  executeCommand({ content, missionId = null, channel = "local-workbench", context = "automatic" }) {
+  executeCommand({ content, missionId = null, channel = "local-workbench", context = "automatic", targetProjectId = null }) {
     const normalized = normalizeText(content, 12_000);
     if (!normalized) throw Object.assign(new Error("命令不能为空"), { statusCode: 400 });
     const commandId = makeId("command");
@@ -1224,9 +1257,9 @@ class OrganizationService {
         if (!selectedMission) throw Object.assign(new Error("没有可进入重度回顾的 Mission"), { statusCode: 409 });
         mission = this.startHeavyReview(selectedMission.id);
         action = "start_heavy_review";
-      } else if (profileMatch) {
+      } else       if (profileMatch) {
         if (!selectedMission) {
-          mission = this.createMission(normalized, profileMap[profileMatch[1].toLowerCase()] || "auto");
+          mission = this.createMission(normalized, profileMap[profileMatch[1].toLowerCase()] || "auto", targetProjectId);
           action = "create_mission";
         } else {
           mission = this.setWorkflowProfile(selectedMission.id, profileMap[profileMatch[1].toLowerCase()] || "auto");
@@ -1254,7 +1287,7 @@ class OrganizationService {
         mission = this.reviseRequirements(selectedMission.id, normalized);
         action = "revise_requirements";
       } else if (!selectedMission || /^(?:新建|创建|开始)(?:一个)?(?:任务|Mission)[:：\s]/i.test(normalized)) {
-        mission = this.createMission(normalized);
+        mission = this.createMission(normalized, "auto", targetProjectId);
         action = "create_mission";
       } else if (["clarifying", "awaiting_baseline_confirmation"].includes(selectedMission.status)) {
         mission = this.addHumanMessage(selectedMission.id, normalized);
@@ -1492,8 +1525,8 @@ class OrganizationService {
           ? source.projectConfigHashes
           : {},
     };
-    if (path.resolve(snapshot.workingDirectory) !== path.resolve(this.project.workingDirectory)) {
-      throw Object.assign(new Error("发布来源工作树与 Mission 工作树不一致"), { statusCode: 409 });
+    if (path.resolve(snapshot.workingDirectory) !== path.resolve(this._projectFor(mission).workingDirectory || this.project.workingDirectory)) {
+      throw Object.assign(new Error("发布来源工作树与 Mission 目标项目工作树不一致"), { statusCode: 409 });
     }
     if (!snapshot.sourceRefCommit || !snapshot.headCommit || !snapshot.branch) {
       throw Object.assign(new Error("发布来源缺少分支或提交身份"), { statusCode: 409 });
@@ -2416,6 +2449,25 @@ class OrganizationService {
     this._autoRequestGateDecision(missionId, to);
   }
 
+  _escalateStalemate(missionId) {
+    const mission = this.mission(missionId);
+    if (!mission || mission.baseline) return;
+    if (Date.now() - Date.parse(mission.createdAt) < CLARIFICATION_BUDGET_MS) return;
+    const open = mission.decisions.some((item) => item.status === "open" && item.kind === "requirements_stalemate");
+    if (open) return;
+    this.requestDecision(missionId, {
+      kind: "requirements_stalemate",
+      title: "需求澄清已超过 20 分钟基线时间",
+      facts: `Mission 创建于 ${mission.createdAt}，至今未形成可确认的需求基线。`,
+      impacts: "继续追问将消耗更多组织资源；可缩小范围或接受风险开工",
+      options: ["继续追问", "缩小范围", "接受遗留风险直接开工"],
+      urgency: "high",
+      objectKind: "Mission",
+      objectVersion: mission.id,
+      noDecisionConsequence: "需求明确岗将继续追问直到人类介入",
+    });
+  }
+
   _queueRequirementRun(missionId, runOptions = {}) {
     this._queueRoleRun(missionId, "requirements-lead", buildRequirementPrompt, (mission, parsed, run) => {
       const questions = Array.isArray(parsed.questions) ? parsed.questions : [];
@@ -2444,6 +2496,7 @@ class OrganizationService {
         this._setStatus(missionId, "awaiting_baseline_confirmation", "需求基线草案等待人类明确确认");
       } else {
         this._setStatus(missionId, "clarifying", questions.length ? "等待人类回答澄清问题" : "需求信息仍不足");
+        this._escalateStalemate(missionId);
       }
     }, runOptions);
   }
@@ -2817,6 +2870,12 @@ class OrganizationService {
       runId,
       invocationId,
       roleId,
+      model: assignment.model,
+      reasoningEffort: assignment.reasoningEffort,
+      scope: mission.workItems
+        .filter((item) => item.ownerRoleId === roleId && item.status !== "completed")
+        .map((item) => item.title),
+      startedAt,
       currentAction: runOptions.resumed ? "从最近检查点恢复现场" : "建立角色执行上下文",
       lastHeartbeatAt: startedAt,
       lastCheckpointAt: runOptions.checkpoint?.at || null,
@@ -2874,7 +2933,7 @@ class OrganizationService {
           .map((item) => item.title),
         adapterId: assignment.adapterId,
         prompt,
-        cwd: this.project.workingDirectory,
+        cwd: this._projectFor(mission).workingDirectory || this.project.workingDirectory,
         model: assignment.model,
         reasoningEffort: assignment.reasoningEffort,
         runId,

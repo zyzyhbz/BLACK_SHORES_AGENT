@@ -1299,8 +1299,7 @@ test("recording waiting consumes no model runs", async () => {  const { director
   assert.equal(updated.runs.length, 0);
 });
 
-test("model outputs are not silently truncated by count, only bounded by size", async () => {
-  const { directory, ledger } = tempLedger();
+test("model outputs are not silently truncated by count, only bounded by size", async () => {  const { directory, ledger } = tempLedger();
   const questions = Array.from({ length: 12 }, (_, index) => ({ id: `q${index}`, question: `问题${index}`, why: "覆盖" }));
   const workItems = Array.from({ length: 10 }, (_, index) => ({ title: `工作${index}`, ownerRoleId: index % 2 ? "engineering" : "independent-reviewer", deliverable: "交付", acceptance: [] }));
   let requirementCalls = 0;
@@ -1326,4 +1325,63 @@ test("model outputs are not silently truncated by count, only bounded by size", 
   await settle(service);
   assert.equal(service.mission(mission.id).workItems.length, 10);
   assert.throws(() => ledger.append("oversize.probe", { payload: { blob: "x".repeat(300 * 1024) } }), /256 KB/);
+});
+
+test("missions bind an explicit target project that routes execution", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    projects: {
+      "project-black-shores": { id: "project-black-shores", name: "Self", workingDirectory: directory },
+    },
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  assert.ok(service.state().projects.some((item) => item.id === "project-black-shores"));
+  assert.throws(() => service.createMission("验证未知项目被拒绝", "auto", "project-nope"), /未知目标项目/);
+  let seenCwd = "";
+  const probing = new OrganizationService({
+    ledger,
+    project: project(directory),
+    projects: {
+      "project-black-shores": { id: "project-black-shores", name: "Self", workingDirectory: directory },
+    },
+    runRole: async (input) => {
+      seenCwd = input.cwd;
+      await new Promise(() => {});
+    },
+  });
+  const mission = probing.createMission("验证目标项目路由", "auto", "project-black-shores");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(probing.mission(mission.id).targetProjectId, "project-black-shores");
+  assert.equal(seenCwd, directory);
+  const active = probing.state().activeRuns[0];
+  assert.ok(Array.isArray(active.scope));
+  assert.ok(active.startedAt);
+  probing.requestSafePause(mission.id);
+});
+
+test("clarification beyond 20 minutes escalates to a human decision", async () => {
+  const { directory } = tempLedger();
+  const ledgerPath = path.join(directory, "ledger.jsonl");
+  const past = new Date(Date.now() - 21 * 60_000).toISOString();
+  const lines = [
+    { id: "evt-old-1", type: "mission.created", at: past, projectId: "project-default", missionId: "mission-stale", actorRoleId: "chief-manager", causationId: null, payload: { title: "陈旧任务", goal: "验证20分钟升级", workflowProfile: "auto" } },
+    { id: "evt-old-2", type: "mission.status_changed", at: past, projectId: "project-default", missionId: "mission-stale", actorRoleId: "chief-manager", causationId: null, payload: { from: "intake", to: "clarifying", reason: "开始" } },
+  ];
+  fs.appendFileSync(ledgerPath, lines.map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
+  const service = new OrganizationService({
+    ledger: new JsonlLedger(ledgerPath),
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "还在问", questions: [] }) }),
+  });
+  assert.equal(service.mission("mission-stale").status, "clarifying");
+  service._escalateStalemate("mission-stale");
+  service._escalateStalemate("mission-stale");
+  const stalemates = service.mission("mission-stale").decisions.filter((item) => item.kind === "requirements_stalemate" && item.status === "open");
+  assert.equal(stalemates.length, 1);
+  const fresh = service.createMission("验证年轻任务不升级");
+  await settle(service);
+  service._escalateStalemate(fresh.id);
+  assert.equal(service.mission(fresh.id).decisions.filter((item) => item.kind === "requirements_stalemate").length, 0);
 });
