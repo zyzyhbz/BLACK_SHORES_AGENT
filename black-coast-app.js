@@ -7,6 +7,7 @@ const navItems = [
   { id: "cognition", label: "认知与决策", icon: "brain" },
   { id: "evolution", label: "演进实验室", icon: "flask-conical" },
   { id: "knowledge", label: "信息与技能", icon: "library" },
+  { id: "issues", label: "问题清单", icon: "list-checks" },
   { id: "organization", label: "组织与角色", icon: "network" },
   { id: "ledger", label: "证据账本", icon: "scroll-text" },
   { id: "resources", label: "AGENT 资源", icon: "cpu" },
@@ -21,6 +22,7 @@ const pageMeta = {
   cognition: ["发散与审议", "认知与决策"],
   evolution: ["观察与改进", "演进实验室"],
   knowledge: ["检索与技能", "信息与技能"],
+  issues: ["待规划到完成", "问题清单"],
   organization: ["责任结构", "组织与角色"],
   ledger: ["统一事实源", "证据账本"],
   resources: ["诊断入口", "AGENT 资源"],
@@ -583,6 +585,7 @@ function renderActiveRun(mission) {
       <div class="activity-line"><span>最后心跳</span><time>${formatTime(active.lastHeartbeatAt)}</time></div>
       <div class="activity-line"><span>最后检查点</span><time>${formatTime(active.lastCheckpointAt)}</time></div>
       ${active.lastCheckpoint?.summary ? `<div class="activity-line"><span>检查点摘要</span><strong>${escapeHtml(active.lastCheckpoint.summary)}</strong></div>` : ""}
+      ${active.lastCheckpoint?.detail ? `<div class="activity-line"><span>检查点明细</span><code>${escapeHtml(active.lastCheckpoint.detail)}</code></div>` : ""}
     </section>`;
 }
 
@@ -1145,6 +1148,91 @@ function renderKnowledge() {
         </aside>
       </div>
     </section>`;
+}
+
+const ISSUE_STATUS_META = [
+  ["backlog", "有待规划"],
+  ["todo", "待办"],
+  ["in_progress", "进行中"],
+  ["in_review", "审核中"],
+  ["done", "已完成"],
+  ["blocked", "已阻塞"],
+  ["cancelled", "已取消"],
+];
+
+function issueStatusLabel(status) {
+  return (ISSUE_STATUS_META.find((item) => item[0] === status) || [status, status])[1];
+}
+
+function renderIssues() {
+  const issues = organizationState?.issues || [];
+  return `
+    <section class="page-section">
+      <header class="section-heading"><div><span class="section-kicker">有待规划到完成</span><h2>问题清单（${issues.length}）</h2></div><button type="button" class="button button-secondary" data-action="new-issue">${icon("plus")}新建问题</button></header>
+      ${ISSUE_STATUS_META.map(([status, label]) => {
+        const group = issues.filter((issue) => issue.status === status);
+        if (!group.length) return "";
+        return `<section class="inspector-section"><header><span>${label}</span><small>${group.length}</small></header><div class="role-grid">${group.map((issue) => `
+          <article class="role-card">
+            <div class="role-card-head"><span>问</span><div><strong>${escapeHtml(issue.title)}</strong><small>${escapeHtml(issue.id)} · 严重度 ${escapeHtml(issue.severity || "")}</small></div></div>
+            <p>${escapeHtml(issue.description || "")}</p>
+            <div class="decision-actions">
+              <select data-issue-status="${escapeHtml(issue.id)}" aria-label="变更状态">
+                ${ISSUE_STATUS_META.map(([value, text]) => `<option value="${value}" ${value === issue.status ? "selected" : ""}>${text}</option>`).join("")}
+              </select>
+              <button type="button" class="button button-secondary" data-action="set-issue-status" data-issue-id="${escapeHtml(issue.id)}">变更状态</button>
+            </div>
+          </article>`).join("")}</div></section>`;
+      }).join("")}
+    </section>`;
+}
+
+function openIssueDialog() {
+  openFormDialog("问题清单", "新建问题", "issueForm", `
+    <label class="field-label form-span"><span>标题</span><input type="text" name="title" required /></label>
+    <label class="field-label"><span>严重度</span><select name="severity"><option value="medium">medium</option><option value="low">low</option><option value="high">high</option><option value="critical">critical</option></select></label>
+    <label class="field-label"><span>初始状态</span><select name="status">${ISSUE_STATUS_META.map(([value, text]) => `<option value="${value}">${text}</option>`).join("")}</select></label>
+    <label class="field-label form-span"><span>描述</span><textarea name="description" rows="3"></textarea></label>`, "创建问题");
+  document.getElementById("issueForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      await api("/api/issues", {
+        method: "POST",
+        body: JSON.stringify({ title: form.get("title"), severity: form.get("severity"), status: form.get("status"), description: form.get("description"), source: "workbench" }),
+      });
+      detailDialog.close();
+      showToast("问题已记入清单");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+async function setIssueStatus(issueId) {
+  const select = document.querySelector(`[data-issue-status="${CSS.escape(issueId)}"]`);
+  if (!select || requestInFlight) return;
+  requestInFlight = true;
+  renderCurrentView();
+  try {
+    await api(`/api/issues/${encodeURIComponent(issueId)}/status`, {
+      method: "POST",
+      body: JSON.stringify({ to: select.value, reason: "工作台变更" }),
+    });
+    showToast(`已变更为${issueStatusLabel(select.value)}`);
+    await refreshState({ quiet: true });
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
 }
 
 function renderLoading() {
@@ -2046,6 +2134,7 @@ function renderCurrentView(editorFocus = captureEditorFocus()) {
       cognition: renderCognition,
       evolution: renderEvolution,
       knowledge: renderKnowledge,
+      issues: renderIssues,
       organization: renderOrganization,
       ledger: renderLedger,
       resources: renderResources,
@@ -2375,6 +2464,8 @@ function bindDynamicEvents() {
       else if (action === "new-waiting") openWaitingDialog(button.dataset.missionId);
       else if (action === "new-manifest") openManifestDialog();
       else if (action === "manage-projects") openProjectDialog();
+      else if (action === "new-issue") openIssueDialog();
+      else if (action === "set-issue-status") setIssueStatus(button.dataset.issueId);
       else if (action === "new-case") openCaseDialog();
       else if (action === "new-idea") openIdeaDialog(button.dataset.missionId, button.dataset.caseId);
       else if (action === "new-brief") openBriefDialog(button.dataset.missionId, button.dataset.caseId);

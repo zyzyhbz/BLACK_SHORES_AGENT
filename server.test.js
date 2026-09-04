@@ -44,6 +44,7 @@ async function startServer({ ledgerPath, worktree, manager, roles, adapters }) {
         codex: { enabled: false },
         cursor: { enabled: false },
         zcode: { enabled: false },
+        opencode: { enabled: false },
         grok: { enabled: false },
         custom: [],
       },
@@ -596,6 +597,28 @@ test("project registry creates from workspace and archives over HTTP", async (co
   const archiveResponse = await fetch(`${server.origin}/api/projects/${created.project.id}/archive`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
   assert.equal(archiveResponse.status, 200);
   assert.equal((await archiveResponse.json()).project.status, "archived");
+});
+
+test("issue inbox API opens and moves issues", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({ ledgerPath: path.join(directory, "ledger.jsonl"), worktree: directory });
+  context.after(() => stopServer(server.child));
+  const createResponse = await fetch(`${server.origin}/api/issues`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "冒烟问题", severity: "low", status: "todo" }),
+  });
+  assert.equal(createResponse.status, 201);
+  const issueId = (await createResponse.json()).issue.id;
+  const moveResponse = await fetch(`${server.origin}/api/issues/${issueId}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ to: "in_review", reason: "自查" }),
+  });
+  assert.equal(moveResponse.status, 200);
+  assert.equal((await moveResponse.json()).issue.status, "in_review");
+  const list = await (await fetch(`${server.origin}/api/issues`)).json();
+  assert.ok(list.issues.some((item) => item.id === issueId));
 });
 
 test("organization stream pushes ledger changes over SSE", async (context) => {

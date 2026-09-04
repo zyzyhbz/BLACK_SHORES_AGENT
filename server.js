@@ -129,6 +129,40 @@ function resolveGrokCommand() {
   return override ? { command: override, prefixArgs: [] } : { command: "grok", prefixArgs: [] };
 }
 
+function resolveOpencodeCommand() {
+  if (appConfig.adapters.opencode?.enabled === false) return null;
+  const override = process.env.BLACK_SHORES_OPENCODE_BIN || appConfig.adapters.opencode?.command;
+  if (override && existingFile(override)) return commandSpec(override);
+  if (process.platform === "win32") {
+    const lookup = spawnSync("where.exe", ["opencode"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    const candidates = String(lookup.stdout || "")
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const executable = candidates.find(
+      (item) => item.toLowerCase().endsWith(".exe") && existingFile(item),
+    );
+    if (executable) return commandSpec(executable);
+    const commandShim = candidates.find(
+      (item) => item.toLowerCase().endsWith(".cmd") && existingFile(item),
+    );
+    if (commandShim) {
+      const cliBinary = path.join(
+        path.dirname(commandShim),
+        "node_modules",
+        "opencode-ai",
+        "bin",
+        "opencode.exe",
+      );
+      if (existingFile(cliBinary)) return commandSpec(cliBinary);
+    }
+  }
+  return { command: "opencode", prefixArgs: [] };
+}
+
 function resolveZcodeBridge() {
   if (process.env.ZCODE_MODEL && process.env.ZCODE_API_KEY) {
     const parts = process.env.ZCODE_MODEL.split("/");
@@ -334,6 +368,7 @@ const codexCommand = resolveCodexCommand();
 const cursorCommand = resolveCursorCommand();
 const zcodeCommand = resolveZcodeCommand(cursorCommand);
 const grokCommand = resolveGrokCommand();
+const opencodeCommand = resolveOpencodeCommand();
 const zcodeConfigPath = path.join(os.homedir(), ".zcode", "cli", "config.json");
 const zcodeSessionDbPath = path.join(
   os.homedir(),
@@ -413,6 +448,9 @@ function createCustomAdapter(definition) {
     },
   };
 }
+
+const OPENCODE_DEFAULT_MODEL = "muse-zen/muse-spark-1.3-contributor-free";
+const OPENCODE_REASONING_OPTIONS = ["minimal", "low", "medium", "high", "xhigh"];
 
 const adapters = {
   codex: {
@@ -620,6 +658,41 @@ const adapters = {
         "--verbatim",
       ];
     },
+  },
+  opencode: {
+    id: "opencode",
+    label: "OpenCode",
+    adapter: "OpenCode CLI",
+    command: opencodeCommand,
+    version: readVersion(opencodeCommand),
+    model: process.env.BLACK_SHORES_OPENCODE_MODEL || appConfig.adapters.opencode?.model || OPENCODE_DEFAULT_MODEL,
+    reasoningEffort:
+      process.env.BLACK_SHORES_OPENCODE_REASONING || appConfig.adapters.opencode?.reasoningEffort || "high",
+    modelOptions: [OPENCODE_DEFAULT_MODEL],
+    reasoningOptions: OPENCODE_REASONING_OPTIONS,
+    supportsReasoning: true,
+    strictModels: false,
+    permissionMode: "full-access",
+    authMode: "local-cli",
+    buildArgs({ cwd, model, reasoningEffort }) {
+      const modelArgs = model ? ["--model", model] : ["--model", OPENCODE_DEFAULT_MODEL];
+      const reasoningArgs =
+        reasoningEffort && reasoningEffort !== "model-default"
+          ? ["--variant", reasoningEffort]
+          : [];
+      return [
+        ...opencodeCommand.prefixArgs,
+        "run",
+        ...modelArgs,
+        ...reasoningArgs,
+        "--format",
+        "json",
+        "--dir",
+        cwd,
+        "--auto",
+      ];
+    },
+    promptViaStdin: true,
   },
 };
 
@@ -941,168 +1014,7 @@ function stripAnsi(value) {
   return String(value).replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "");
 }
 
-function contentText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((item) => item && (item.type === "text" || typeof item.text === "string"))
-    .map((item) => item.text || "")
-    .join("");
-}
-
-function normalizeUsage(usage) {
-  if (!usage || typeof usage !== "object") return null;
-  return {
-    input_tokens: usage.input_tokens ?? usage.inputTokens ?? 0,
-    cached_input_tokens:
-      usage.cached_input_tokens ??
-      usage.cache_read_input_tokens ??
-      usage.cacheReadInputTokens ??
-      usage.cacheReadTokens ??
-      0,
-    output_tokens: usage.output_tokens ?? usage.outputTokens ?? 0,
-    reasoning_tokens: usage.reasoning_tokens ?? usage.reasoningTokens ?? 0,
-    total_tokens: usage.total_tokens ?? usage.totalTokens,
-  };
-}
-
-function sessionEvent(raw, state) {
-  const sessionId = raw.session_id || raw.sessionId || raw.thread_id || raw.threadId;
-  if (!sessionId || sessionId === state.sessionId) return null;
-  state.sessionId = sessionId;
-  return { type: "hub.session", sessionId };
-}
-
-function normalizeEvent(adapter, raw, state) {
-  const events = [];
-  const session = sessionEvent(raw, state);
-  if (session) events.push(session);
-
-  if (raw.type === "error" || raw.type === "turn.failed" || raw.is_error === true) {
-    events.push({
-      type: "hub.error",
-      message: raw.error?.message || raw.message || raw.result || `${adapter.label} 执行失败`,
-    });
-    return events;
-  }
-
-  if (adapter.id === "codex") {
-    if (raw.type === "thread.started") {
-      events.push({ type: "hub.progress", message: "正在分析任务" });
-    } else if (raw.type === "item.started") {
-      events.push({ type: "hub.progress", message: "正在执行" });
-    } else if (raw.type === "item.completed") {
-      if (raw.item?.type === "agent_message" && raw.item.text) {
-        events.push({ type: "hub.result", text: raw.item.text });
-      } else if (raw.item?.type === "command_execution") {
-        events.push({ type: "hub.progress", message: "工具步骤已完成" });
-      }
-    } else if (raw.type === "turn.completed") {
-      const usage = normalizeUsage(raw.usage);
-      if (usage) events.push({ type: "hub.usage", usage });
-    }
-    return events;
-  }
-
-  if (adapter.id === "grok") {
-    if (raw.type === "thought" && !state.thinking) {
-      state.thinking = true;
-      events.push({ type: "hub.progress", message: "正在推理" });
-    } else if (raw.type === "text" && typeof raw.data === "string") {
-      events.push({ type: "hub.delta", text: raw.data });
-    } else if (raw.type === "usage" || raw.type === "end") {
-      const usage = normalizeUsage(raw.usage);
-      if (usage) events.push({ type: "hub.usage", usage });
-    }
-    return events;
-  }
-
-  if (adapter.id === "zcode") {
-    if (raw.type === "model.streaming") {
-      const kind = raw.payload?.kind;
-      if (kind === "reasoning_start" && !state.thinking) {
-        state.thinking = true;
-        events.push({ type: "hub.progress", message: "正在推理" });
-      } else if (kind === "text_delta" && typeof raw.payload?.delta === "string") {
-        events.push({ type: "hub.delta", text: raw.payload.delta });
-      }
-    } else if (raw.type === "session.updated") {
-      const runtimeModel =
-        typeof raw.payload?.model === "string"
-          ? raw.payload.model
-          : raw.payload?.model?.providerId && raw.payload?.model?.modelId
-            ? `${raw.payload.model.providerId}/${raw.payload.model.modelId}`
-            : "";
-      if (runtimeModel && runtimeModel !== state.runtimeModel) {
-        state.runtimeModel = runtimeModel;
-        events.push({ type: "hub.runtime", model: runtimeModel });
-      }
-      const runtimeReasoning = raw.payload?.modelCall?.reasoning?.effectiveLevel;
-      const runtimeReasoningBudget =
-        raw.payload?.modelCall?.reasoning?.effectiveBudgetTokens;
-      if (
-        runtimeReasoning &&
-        (runtimeReasoning !== state.runtimeReasoning ||
-          runtimeReasoningBudget !== state.runtimeReasoningBudget)
-      ) {
-        state.runtimeReasoning = runtimeReasoning;
-        state.runtimeReasoningBudget = runtimeReasoningBudget;
-        events.push({
-          type: "hub.runtime",
-          model: state.runtimeModel,
-          reasoningEffort: runtimeReasoning,
-          reasoningBudgetTokens: runtimeReasoningBudget,
-        });
-      }
-      if (typeof raw.payload?.content === "string") {
-        events.push({ type: "hub.result", text: raw.payload.content });
-      }
-      const usage = normalizeUsage(raw.payload?.usage);
-      if (usage) events.push({ type: "hub.usage", usage });
-    } else if (raw.type === "turn.completed") {
-      if (typeof raw.payload?.response === "string") {
-        events.push({ type: "hub.result", text: raw.payload.response });
-      }
-      const usage = normalizeUsage(raw.payload?.usage);
-      if (usage) events.push({ type: "hub.usage", usage });
-    } else if (raw.type === "result") {
-      if (typeof raw.response === "string") {
-        events.push({ type: "hub.result", text: raw.response });
-      }
-      const usage = normalizeUsage(raw.usage);
-      if (usage) events.push({ type: "hub.usage", usage });
-    }
-    return events;
-  }
-
-  if (raw.type === "connection" || raw.type === "retry") {
-    const message = raw.subtype === "reconnecting" ? "上游连接中断，正在重连" : "正在连接上游服务";
-    events.push({ type: "hub.progress", message });
-  } else if (raw.type === "system" && raw.subtype === "init") {
-    if (raw.model) events.push({ type: "hub.runtime", model: raw.model });
-    events.push({ type: "hub.progress", message: "会话已建立" });
-  } else if (raw.type === "assistant") {
-    const text = contentText(raw.message?.content ?? raw.content);
-    if (text) events.push({ type: "hub.result", text });
-  } else if (raw.type === "result") {
-    const text =
-      typeof raw.result === "string"
-        ? raw.result
-        : contentText(raw.message?.content ?? raw.content);
-    if (text) events.push({ type: "hub.result", text });
-    const usage = normalizeUsage(raw.usage);
-    if (usage) events.push({ type: "hub.usage", usage });
-  } else if (raw.type === "text" && typeof raw.data === "string") {
-    events.push({ type: "hub.delta", text: raw.data });
-  } else if (raw.type === "usage") {
-    const usage = normalizeUsage(raw.usage);
-    if (usage) events.push({ type: "hub.usage", usage });
-  } else if (raw.type?.includes("tool")) {
-    events.push({ type: "hub.progress", message: "正在执行工具步骤" });
-  }
-
-  return events;
-}
+const { contentText, normalizeUsage, normalizeEvent } = require("./adapter-events");
 
 function readRunOption(value, fallback, label) {
   if (value === undefined || value === null || value === "") return fallback;
@@ -1463,7 +1375,12 @@ function runAdapterBuffered(
     child.stdout.on("data", (chunk) => {
       if (adapter.outputFormat === "text") {
         stdoutBuffer += chunk;
-        onActivity?.({ type: "hub.progress", message: "AGENT 正在生成结果" });
+        const receivedBytes = Buffer.byteLength(stdoutBuffer);
+        const now = Date.now();
+        if (!state.lastTextProgressAt || now - state.lastTextProgressAt > 60_000) {
+          state.lastTextProgressAt = now;
+          onActivity?.({ type: "hub.progress", message: `正在生成结果（已接收约${Math.max(1, Math.round(receivedBytes / 1024))} KB）` });
+        }
         return;
       }
       stdoutBuffer += chunk;
@@ -2019,6 +1936,32 @@ const server = http.createServer(async (request, response) => {
     try {
       const payload = await readJsonBody(request);
       sendJson(response, 200, runtimeGovernance.revertAction(decodeURIComponent(revertMatch[1]), payload));
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/issues") {
+    sendJson(response, 200, { issues: organization.state().issues });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/issues") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { issue: organization.openIssue(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const issueStatusMatch = url.pathname.match(/^\/api\/issues\/([^/]+)\/status$/);
+  if (request.method === "POST" && issueStatusMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, { issue: organization.setIssueStatus(decodeURIComponent(issueStatusMatch[1]), payload) });
     } catch (error) {
       organizationError(response, error);
     }

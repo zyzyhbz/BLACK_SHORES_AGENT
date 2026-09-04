@@ -54,6 +54,7 @@ const DEFAULT_CONFIG = {
     cursor: { enabled: true, command: "", model: "auto", reasoningEffort: "model-default" },
     zcode: { enabled: true, node: "", script: "", model: "", reasoningEffort: "" },
     grok: { enabled: true, command: "", model: "", reasoningEffort: "default" },
+    opencode: { enabled: true, command: "", model: "", reasoningEffort: "" },
     custom: [],
   },
 };

@@ -162,6 +162,8 @@ function retrievalFocusFor(roleId) {
 
 const CLARIFICATION_BUDGET_MS = 20 * 60_000;
 
+const ISSUE_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"]);
+
 const DEFAULT_SELF_PROJECT = {
   id: "project-black-shores",
   name: "黑海岸 Agent 自身",
@@ -878,7 +880,7 @@ class OrganizationService {
       ),
       project: this.project,
       projects: this._projectRegistry(),
-      projectTestManifest: this.projectTestManifest,
+      issues: this._issueRegistry(),      projectTestManifest: this.projectTestManifest,
       projectTestManifests: this.ledger.events()
         .filter((event) => event.type === "test_manifest.published")
         .map((event) => ({
@@ -1045,8 +1047,59 @@ class OrganizationService {
     return [...Object.values(this.projects).map((item) => ({ status: "active", builtin: true, ...item })), ...registered.values()];
   }
 
-  _projectFor(mission) {
-    const target = mission?.targetProjectId || mission?.projectId;
+  _issueRegistry() {
+    const issues = new Map();
+    for (const event of this.ledger.events()) {
+      if (event.type === "issue.opened") {
+        issues.set(event.payload.id, { openedAt: event.at, history: [], ...event.payload });
+      } else if (event.type === "issue.status_changed" && issues.has(event.payload.id)) {
+        const issue = issues.get(event.payload.id);
+        issue.status = event.payload.to;
+        issue.updatedAt = event.at;
+        issue.history.push({ at: event.at, from: event.payload.from, to: event.payload.to, reason: event.payload.reason });
+      }
+    }
+    return [...issues.values()].sort((left, right) => String(right.openedAt).localeCompare(String(left.openedAt)));
+  }
+
+  openIssue(input) {
+    assertObject(input, "问题事项");
+    const title = normalizeText(input.title, 500);
+    if (title.length < 4) throw Object.assign(new Error("问题事项需要明确标题"), { statusCode: 400 });
+    const status = normalizeText(input.status, 40) || "backlog";
+    if (!ISSUE_STATUSES.has(status)) throw Object.assign(new Error("未知的问题状态"), { statusCode: 400 });
+    const id = makeId("iss");
+    this.ledger.append("issue.opened", {
+      actorRoleId: "human-owner",
+      payload: {
+        id,
+        title,
+        description: normalizeText(input.description, 8000),
+        severity: ["low", "medium", "high", "critical"].includes(input.severity) ? input.severity : "medium",
+        status,
+        source: normalizeText(input.source, 500),
+      },
+    });
+    return this._issueRegistry().find((item) => item.id === id);
+  }
+
+  setIssueStatus(issueId, input) {
+    assertObject(input, "状态变更");
+    const to = normalizeText(input.to, 40);
+    if (!ISSUE_STATUSES.has(to)) throw Object.assign(new Error("未知的问题状态"), { statusCode: 400 });
+    const issue = this._issueRegistry().find((item) => item.id === issueId);
+    if (!issue) throw Object.assign(new Error("问题事项不存在"), { statusCode: 404 });
+    if ((issue.status === "done" || issue.status === "cancelled") && to !== "todo" && to !== "backlog") {
+      throw Object.assign(new Error("已终结的问题只能重开回待办或规划"), { statusCode: 409 });
+    }
+    this.ledger.append("issue.status_changed", {
+      actorRoleId: "human-owner",
+      payload: { id: issueId, from: issue.status, to, reason: normalizeText(input.reason, 2000) || "" },
+    });
+    return this._issueRegistry().find((item) => item.id === issueId);
+  }
+
+  _projectFor(mission) {    const target = mission?.targetProjectId || mission?.projectId;
     const registry = this._projectRegistry();
     return registry.find((item) => item.id === target && item.status !== "archived")
       || this.projects[target]
@@ -2976,6 +3029,8 @@ class OrganizationService {
       lastHeartbeatAt: startedAt,
       lastCheckpointAt: runOptions.checkpoint?.at || null,
       lastCheckpoint: runOptions.checkpoint || null,
+      lastDeltaAt: 0,
+      lastDeltaCheckpointAt: 0,
       lastPersistedHeartbeatAt: 0,
       resumed: runOptions.resumed === true,
       pauseRequested: false,
@@ -2996,8 +3051,9 @@ class OrganizationService {
     };
     const onActivity = (event = {}) => {
       if (this.activeRuns.get(missionId) !== active) return;
-      const message = normalizeText(event.message || event.text || event.type, 2000);
-      if (message) active.currentAction = message;
+      if ((event.message || event.text) && event.type !== "hub.usage") {
+        active.currentAction = normalizeText(event.message || event.text, 2000);
+      }
       recordHeartbeat(false);
       if (event.type === "hub.progress" || event.type === "hub.runtime") {
         const checkpoint = this.ledger.append("run.checkpointed", {
@@ -3007,12 +3063,26 @@ class OrganizationService {
             runId,
             invocationId,
             kind: event.type === "hub.progress" ? "progress" : "runtime",
-            summary: message || active.currentAction,
+            summary: normalizeText(event.message || active.currentAction, 2000),
+            detail: normalizeText(event.detail, 2000) || undefined,
             runtime: event.type === "hub.runtime" ? event : undefined,
           },
         });
         active.lastCheckpointAt = checkpoint.at;
         active.lastCheckpoint = { id: checkpoint.id, at: checkpoint.at, ...checkpoint.payload };
+      } else if (event.type === "hub.delta") {
+        const timestamp = Date.now();
+        active.lastDeltaAt = timestamp;
+        if (!active.lastDeltaCheckpointAt || timestamp - active.lastDeltaCheckpointAt > 60_000) {
+          active.lastDeltaCheckpointAt = timestamp;
+          const checkpoint = this.ledger.append("run.checkpointed", {
+            missionId,
+            actorRoleId: roleId,
+            payload: { runId, invocationId, kind: "progress", summary: "持续接收模型输出" },
+          });
+          active.lastCheckpointAt = checkpoint.at;
+          active.lastCheckpoint = { id: checkpoint.id, at: checkpoint.at, ...checkpoint.payload };
+        }
       }
     };
     recordHeartbeat(true);

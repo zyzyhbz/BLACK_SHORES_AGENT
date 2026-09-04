@@ -1385,6 +1385,27 @@ test("clarification beyond 20 minutes escalates to a human decision", async () =
   assert.equal(service.mission(fresh.id).decisions.filter((item) => item.kind === "requirements_stalemate").length, 0);
 });
 
+test("issues track the seven-state workflow with terminal guards", async () => {
+  const { ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project("d"),
+    runRole: async () => { throw new Error("unused"); },
+  });
+  assert.throws(() => service.openIssue({ title: "x" }), /明确标题/);
+  const opened = service.openIssue({ title: "适配器上报空话", description: "检查点摘要无实质", severity: "high", status: "in_review" });
+  assert.equal(opened.status, "in_review");
+  assert.equal(service.state().issues.length, 1);
+  const moved = service.setIssueStatus(opened.id, { to: "in_progress", reason: "开始约束上报格式" });
+  assert.equal(moved.status, "in_progress");
+  assert.equal(moved.history.at(-1).from, "in_review");
+  const done = service.setIssueStatus(opened.id, { to: "done", reason: "完成" });
+  assert.equal(done.status, "done");
+  assert.throws(() => service.setIssueStatus(opened.id, { to: "in_progress", reason: "回退" }), /重开/);
+  const reopened = service.setIssueStatus(opened.id, { to: "todo", reason: "复发" });
+  assert.equal(reopened.status, "todo");
+});
+
 test("projects are created from a workspace and archived only when quiet", async () => {
   const { directory, ledger } = tempLedger();
   const workspace = path.join(directory, "demo-proj");
@@ -1409,4 +1430,30 @@ test("projects are created from a workspace and archived only when quiet", async
   assert.throws(() => service.createMission("验证归档项目不可用", "auto", created.id), /已归档/);
   const reopened = service.reopenProject(created.id);
   assert.equal(reopened.status, "active");
+});
+
+test("usage never overwrites the current action and details reach checkpoints", async () => {
+  const { directory, ledger } = tempLedger();
+  let captured = null;
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async (input) => {
+      captured = input;
+      await new Promise(() => {});
+    },
+  });
+  const mission = service.createMission("验证动作上报语义");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const active = service.activeRuns.get(mission.id);
+  assert.ok(active);
+  active.currentAction = "正在分析任务";
+  captured.onActivity({ type: "hub.usage", usage: { input_tokens: 5 } });
+  assert.equal(service.activeRuns.get(mission.id).currentAction, "正在分析任务");
+  captured.onActivity({ type: "hub.progress", message: "执行工具：pnpm test", detail: "{\"command\":\"pnpm test\"}" });
+  assert.equal(service.activeRuns.get(mission.id).currentAction, "执行工具：pnpm test");
+  const checkpoint = ledger.events().filter((event) => event.type === "run.checkpointed").at(-1);
+  assert.equal(checkpoint.payload.summary, "执行工具：pnpm test");
+  assert.match(checkpoint.payload.detail, /pnpm test/);
+  service.requestSafePause(mission.id);
 });
