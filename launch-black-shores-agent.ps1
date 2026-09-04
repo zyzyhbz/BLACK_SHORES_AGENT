@@ -7,14 +7,13 @@ if ($installedTask) {
   exit 0
 }
 
-$workerPath = Join-Path $PSScriptRoot "start-black-shores-agent-hidden.ps1"
-$powershellPath = Join-Path $PSHOME "powershell.exe"
-if (-not (Test-Path -LiteralPath $powershellPath)) {
-  $powershellPath = (Get-Command powershell.exe -ErrorAction Stop).Source
+$workerPath = Join-Path $PSScriptRoot "start-black-shores-agent-hidden.vbs"
+$wscriptPath = Join-Path $env:SystemRoot "System32\wscript.exe"
+if (-not (Test-Path -LiteralPath $wscriptPath)) {
+  $wscriptPath = (Get-Command wscript.exe -ErrorAction Stop).Source
 }
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$workerPath`""
 Start-Process `
-  -FilePath $powershellPath `
-  -ArgumentList $arguments `
+  -FilePath $wscriptPath `
+  -ArgumentList "`"$workerPath`"" `
   -WorkingDirectory $PSScriptRoot `
   -WindowStyle Hidden

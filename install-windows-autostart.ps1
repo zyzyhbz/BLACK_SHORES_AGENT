@@ -1,14 +1,14 @@
 $ErrorActionPreference = "Stop"
 
 $taskName = "BLACK_SHORES_AGENT"
-$launcherPath = Join-Path $PSScriptRoot "start-black-shores-agent-hidden.ps1"
-$powershellPath = Join-Path $PSHOME "powershell.exe"
-if (-not (Test-Path -LiteralPath $powershellPath)) {
-  $powershellPath = (Get-Command powershell.exe -ErrorAction Stop).Source
+$launcherPath = Join-Path $PSScriptRoot "start-black-shores-agent-hidden.vbs"
+$wscriptPath = Join-Path $env:SystemRoot "System32\wscript.exe"
+if (-not (Test-Path -LiteralPath $wscriptPath)) {
+  $wscriptPath = (Get-Command wscript.exe -ErrorAction Stop).Source
 }
 
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcherPath`""
-$action = New-ScheduledTaskAction -Execute $powershellPath -Argument $arguments -WorkingDirectory $PSScriptRoot
+$arguments = "`"$launcherPath`""
+$action = New-ScheduledTaskAction -Execute $wscriptPath -Argument $arguments -WorkingDirectory $PSScriptRoot
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $watchdogTrigger = New-ScheduledTaskTrigger `
   -Once `

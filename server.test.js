@@ -379,17 +379,23 @@ test("projects and inspections expose isolation and patrol state", async (contex
   assert.ok(Array.isArray(inspections.findings));
 });
 
-test("the Windows command launcher never owns the long-running Node process", () => {
+test("the Windows launchers never allocate a console for the long-running Node process", () => {
   const commandLauncher = fs.readFileSync(path.join(__dirname, "start-black-shores-agent.cmd"), "utf8");
   const backgroundLauncher = fs.readFileSync(path.join(__dirname, "launch-black-shores-agent.ps1"), "utf8");
   const installer = fs.readFileSync(path.join(__dirname, "install-windows-autostart.ps1"), "utf8");
+  const windowlessLauncher = fs.readFileSync(path.join(__dirname, "start-black-shores-agent-hidden.vbs"), "utf8");
   assert.doesNotMatch(commandLauncher, /\bnode(?:\.exe)?\s+server\.js\b/i);
-  assert.match(commandLauncher, /launch-black-shores-agent\.ps1/i);
+  assert.match(commandLauncher, /start-black-shores-agent-hidden\.vbs/i);
   assert.match(backgroundLauncher, /Start-ScheduledTask/);
-  assert.match(backgroundLauncher, /Start-Process/);
-  assert.match(backgroundLauncher, /WindowStyle Hidden/);
+  assert.match(backgroundLauncher, /wscript/i);
+  assert.match(backgroundLauncher, /start-black-shores-agent-hidden\.vbs/i);
+  assert.match(installer, /wscript/i);
+  assert.match(installer, /start-black-shores-agent-hidden\.vbs/i);
   assert.match(installer, /watchdogTrigger/);
   assert.match(installer, /RepetitionInterval/);
+  assert.match(windowlessLauncher, /WScript\.Shell/);
+  assert.match(windowlessLauncher, /, 0, False/);
+  assert.match(windowlessLauncher, /4782/);
 });
 
 test("configuration API persists manager and per-role assignments and registers a new AGENT", async (context) => {
