@@ -366,6 +366,8 @@ test("the workbench exposes every human-facing Mission control", () => {
   assert.match(source, /organizationState\?\.controls\?\.canCreateMission/);
   assert.match(source, /commandDrafts/);
   assert.match(source, /commandSelections/);
+  assert.match(source, /compositionstart/);
+  assert.match(source, /refreshDeferred/);
 });
 
 test("projects and inspections expose isolation and patrol state", async (context) => {
