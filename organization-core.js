@@ -176,6 +176,8 @@ const GATE_REGISTRY = [
   { id: "G-RECOVERY", name: "恢复预算门禁", checks: "开放阻塞 + 剩余恢复次数 + 可恢复角色", evidence: "blocker + attemptBudget", owner: "blocker-lead", failResult: "转人类处理", overridable: true },
   { id: "G-ASSIGN", name: "任职门禁", checks: "模型与推理强度组合受适配器支持", evidence: "AssignmentSnapshot", owner: "chief-manager", failResult: "拒绝派活", overridable: false },
   { id: "G-PROJECT", name: "项目门禁", checks: "目标项目存在且未归档", evidence: "project registry", owner: "human-owner", failResult: "拒绝建会话", overridable: false },
+  { id: "G-BLOCK-DECLARE", name: "阻塞声明门禁", checks: "阻塞须引用失败门禁编号或给出根因假设与证据；有明确预期时间的一律记为等待", evidence: "failedGateId 或 hypothesis+evidence", owner: "blocker-lead", failResult: "拒绝建阻塞", overridable: false },
+  { id: "G-QUALITY", name: "质量判定门禁", checks: "结果验收前存在通过的质量判定", evidence: "quality.decided[passed]", owner: "human-owner", failResult: "不得验收", overridable: false },
 ];
 
 function gateError(gateId, message, statusCode = 409) {
@@ -1577,12 +1579,18 @@ class OrganizationService {
 
   reviseRequirements(missionId, content) {
     const mission = this._requireMission(missionId);
-    if (this.activeRuns.has(missionId)) {
-      throw Object.assign(new Error("请先安全暂停当前 Run，再提交中途修改"), { statusCode: 409 });
-    }
     this._assertNoOtherActiveRun(missionId);
     if (!["waiting", "blocked"].includes(mission.status)) {
       throw Object.assign(new Error(`当前状态 ${mission.status} 不能回到需求明确岗`), { statusCode: 409 });
+    }
+    const active = this.activeRuns.get(missionId);
+    if (active) {
+      active.superseded = true;
+      active.currentAction = "需求世代递增，旧世代 Run 被取代";
+      try {
+        active.abortController.abort();
+      } catch {}
+      this.activeRuns.delete(missionId);
     }
     const normalized = normalizeText(content, 12_000);
     if (!normalized) throw Object.assign(new Error("修改要求不能为空"), { statusCode: 400 });
@@ -1636,39 +1644,62 @@ class OrganizationService {
     return this.mission(missionId);
   }
 
-  retry(missionId) {
+  retry(missionId, input = {}) {
     const mission = this._requireMission(missionId);
     if (mission.status !== "blocked") {
       throw gateError("G-RECOVERY", "只有阻塞 Mission 可以重试");
     }
     this._assertNoOtherActiveRun(missionId);
     const openBlocker = mission.blockers.findLast((item) => item.status === "open");
-    if (!openBlocker) throw Object.assign(new Error("没有开放的 BlockerCase"), { statusCode: 409 });
+    if (!openBlocker) throw gateError("G-RECOVERY", "没有开放的 BlockerCase");
+    const hypothesis = normalizeText(input.hypothesis, 2000)
+      || openBlocker.hypothesis
+      || openBlocker.error
+      || "";
+    if (hypothesis.length < 4) {
+      throw gateError("G-RECOVERY", "恢复必须给出本轮根因假设，不能无假设重试");
+    }
     const attempts = mission.blockers.filter(
       (item) => item.status === "closed" && item.resolution === "retry",
-    ).length;
-    if (attempts >= this.maxRecoveryAttempts) {
+    );
+    if (attempts.length >= this.maxRecoveryAttempts) {
       throw gateError("G-RECOVERY", "恢复预算已耗尽，需要人类处理");
     }
+    const lastAttempt = attempts.at(-1);
+    const override = input.assignment && typeof input.assignment === "object" ? input.assignment : null;
+    const overrideAdapter = normalizeText(override?.adapterId, 120);
+    if (override && !overrideAdapter) {
+      throw gateError("G-RECOVERY", "换路必须指定有效的适配器", 400);
+    }
+    if (lastAttempt && ideaClusterSimilarity(lastAttempt.hypothesis || "", hypothesis) > 0.8) {
+      const lastAdapter = normalizeText(lastAttempt.assignment?.adapterId, 120);
+      if (!overrideAdapter || overrideAdapter === lastAdapter) {
+        throw gateError("G-RECOVERY", "同一假设已尝试过且路径未变，请更换任职/模型/路径，或升级人类处理");
+      }
+    }
     const roleId = openBlocker.failedRoleId || mission.runs.at(-1)?.roleId;
-    if (!roleId) throw Object.assign(new Error("BlockerCase 缺少可恢复责任角色"), { statusCode: 409 });
+    if (!roleId) throw gateError("G-RECOVERY", "BlockerCase 缺少可恢复责任角色");
     this.ledger.append("blocker.closed", {
       missionId,
       actorRoleId: "blocker-lead",
       payload: {
         id: openBlocker.id,
         resolution: "retry",
-        attemptNumber: attempts + 1,
+        attemptNumber: attempts.length + 1,
         attemptBudget: this.maxRecoveryAttempts,
+        hypothesis,
+        evidence: normalizeText(input.evidence, 4000),
+        assignment: override ? { adapterId: overrideAdapter, model: normalizeText(override.model, 200), reasoningEffort: normalizeText(override.reasoningEffort, 80) } : null,
       },
     });
-    this._setStatus(missionId, this._statusForRole(roleId), `解障负责人发起第 ${attempts + 1} 次有限恢复`);
-    if (roleId === "requirements-lead") this._queueRequirementRun(missionId);
-    else if (roleId === "chief-manager") this._queueManagerPlan(missionId);
-    else if (roleId === "engineering") this._queueEngineeringRun(missionId);
-    else if (roleId === "independent-reviewer") this._queueReviewRun(missionId);
-    else if (roleId === "tester") this._queueTestRun(missionId);
-    else throw Object.assign(new Error(`暂不支持恢复角色 ${roleId}`), { statusCode: 409 });
+    this._setStatus(missionId, this._statusForRole(roleId), `解障负责人发起第 ${attempts.length + 1} 次有限恢复`);
+    const runOptions = override ? { assignment: { adapterId: overrideAdapter, model: normalizeText(override.model, 200), reasoningEffort: normalizeText(override.reasoningEffort, 80) } } : {};
+    if (roleId === "requirements-lead") this._queueRequirementRun(missionId, runOptions);
+    else if (roleId === "chief-manager") this._queueManagerPlan(missionId, runOptions);
+    else if (roleId === "engineering") this._queueEngineeringRun(missionId, runOptions);
+    else if (roleId === "independent-reviewer") this._queueReviewRun(missionId, runOptions);
+    else if (roleId === "tester") this._queueTestRun(missionId, runOptions);
+    else throw gateError("G-RECOVERY", `暂不支持恢复角色 ${roleId}`);
     return this.mission(missionId);
   }
 
@@ -1885,6 +1916,9 @@ class OrganizationService {
       (item) => item.candidateId === mission.releaseCandidate.id && item.result === "passed",
     );
     if (!evidence) throw gateError("G-ACCEPT", "缺少绑定当前候选的通过外部验收证据");
+    if (!mission.qualityDecisions.some((item) => item.verdict === "passed")) {
+      throw gateError("G-QUALITY", "缺少通过的质量判定，不得验收业务结果");
+    }
     this._recordCandidateApproval(mission, "result_acceptance", "人类明确验收业务结果");
     this._setStatus(missionId, "accepted", "人类已验收业务结果，Mission 完成");
     return this.mission(missionId);
@@ -2304,13 +2338,19 @@ class OrganizationService {
     const now = Date.now();
     for (const mission of this.state().missions) {
       for (const run of mission.runs || []) {
-        if (run.status !== "running") continue;
-        const heartbeatAge = run.lastHeartbeatAt ? now - Date.parse(run.lastHeartbeatAt) : Number.POSITIVE_INFINITY;
+        if (run.status !== "running") continue;        const heartbeatAge = run.lastHeartbeatAt ? now - Date.parse(run.lastHeartbeatAt) : Number.POSITIVE_INFINITY;
         const checkpointAge = run.lastCheckpointAt ? now - Date.parse(run.lastCheckpointAt) : Number.POSITIVE_INFINITY;
         if (checkpointAge > 5 * 60_000) {
           findings.push({ level: "warning", missionId: mission.id, kind: "suspected_stall", detail: `Run ${run.id} 已超过 5 分钟没有有效进度检查点` });
         } else if (heartbeatAge > 5 * 60_000) {
           findings.push({ level: "warning", missionId: mission.id, kind: "connection_anomaly", detail: `Run ${run.id} 已超过 5 分钟没有心跳` });
+        }
+      }
+      for (const run of mission.runs || []) {
+        if (run.status !== "completed" && run.status !== "running") continue;
+        const fidelity = run.modelFidelity;
+        if (fidelity && fidelity.actual && fidelity.requested && !fidelity.match) {
+          findings.push({ level: "warning", missionId: mission.id, kind: "model_drift", detail: `Run ${run.id} 任职模型 ${fidelity.requested}，实际执行 ${fidelity.actual}` });
         }
       }
       if (mission.status === "blocked") {
@@ -2527,8 +2567,22 @@ class OrganizationService {
     }
   }
 
-  _openBlocker(missionId, { category, roleId, runId = null, error }) {
+  _openBlocker(missionId, { category, roleId, runId = null, error, failedGateId = null, diagnosis = null, expectedAt = null }) {
     const mission = this._requireMission(missionId);
+    if (expectedAt && Date.parse(expectedAt) > Date.now()) {
+      throw gateError("G-BLOCK-DECLARE", "存在明确预期时间的等待不得建立阻塞，请记录等待条件");
+    }
+    let gate = null;
+    if (failedGateId) {
+      gate = GATE_REGISTRY.find((item) => item.id === failedGateId) || null;
+      if (!gate) throw gateError("G-BLOCK-DECLARE", `引用的门禁不存在：${failedGateId}`, 400);
+    }
+    const stated = diagnosis && typeof diagnosis === "object" ? diagnosis : null;
+    const hypothesis = normalizeText(stated?.hypothesis, 2000);
+    const evidence = normalizeText(stated?.evidence, 4000);
+    if (!gate && (hypothesis.length < 4 || evidence.length < 4)) {
+      throw gateError("G-BLOCK-DECLARE", "阻塞声明必须引用失败门禁编号，或给出根因假设与证据");
+    }
     const usedAttempts = mission.blockers.filter(
       (item) => item.status === "closed" && item.resolution === "retry",
     ).length;
@@ -2544,7 +2598,13 @@ class OrganizationService {
         runId,
         attemptsUsed: usedAttempts,
         attemptBudget: this.maxRecoveryAttempts,
+        attempts: [],
         error: normalizeText(error, 12_000),
+        failedGateId: gate ? gate.id : null,
+        hypothesis: gate ? "" : hypothesis,
+        evidence: gate ? "" : evidence,
+        triedAlternatives: Array.isArray(stated?.triedAlternatives) ? stated.triedAlternatives.map((item) => normalizeText(item, 1000)).filter(Boolean) : [],
+        neededFromHuman: normalizeText(stated?.neededFromHuman, 2000),
       },
     });
     this.ledger.append("message.recorded", {
@@ -2749,6 +2809,12 @@ class OrganizationService {
           roleId: "engineering",
           runId: run.id,
           error: parsed.next || "工程执行报告阻塞",
+          diagnosis: {
+            hypothesis: parsed.rootCause || parsed.next || "工程执行报告阻塞",
+            evidence: [...(parsed.artifacts || []), ...(parsed.tests || []).map((test) => `${test.command}:${test.result}`)].join("；"),
+            triedAlternatives: parsed.changes || [],
+            neededFromHuman: parsed.next,
+          },
         });
         return;
       }
@@ -2803,6 +2869,11 @@ class OrganizationService {
           roleId: "independent-reviewer",
           runId: run.id,
           error: parsed.message || "独立复核无法继续",
+          diagnosis: {
+            hypothesis: (parsed.findings || []).map((finding) => finding.title).join("；") || parsed.message || "独立复核无法继续",
+            evidence: (parsed.findings || []).map((finding) => finding.evidence).filter(Boolean).join("；"),
+            neededFromHuman: parsed.message,
+          },
         });
         return;
       }
@@ -2898,6 +2969,7 @@ class OrganizationService {
           roleId: "tester",
           runId: run.id,
           error: parsed.message || "测试运行无法继续",
+          failedGateId: "G-TEST",
         });
         return;
       }
@@ -2971,6 +3043,11 @@ class OrganizationService {
         roleId,
         runId: runOptions.runId || null,
         error: `暂不支持续作角色 ${roleId}`,
+        diagnosis: {
+          hypothesis: `恢复调度不支持角色 ${roleId}`,
+          evidence: `runId=${runOptions.runId || "无"}`,
+          neededFromHuman: "请人类指定可恢复的角色或取消任务",
+        },
       });
     }
   }
@@ -2984,13 +3061,16 @@ class OrganizationService {
     const runId = runOptions.runId || makeId("run");
     const invocationId = makeId("invocation");
     const role = ROLE_BY_ID.get(roleId);
-    const assignment = this._assignmentForRole(roleId);
+    const assignment = runOptions.assignment && runOptions.assignment.adapterId
+      ? { ...this._assignmentForRole(roleId), ...runOptions.assignment, overridden: true }
+      : this._assignmentForRole(roleId);
     if (!assignment.ready) {
       this._openBlocker(missionId, {
         category: "agent_assignment_unavailable",
         roleId,
         runId,
         error: assignment.message || `角色 ${role.name} 没有可用的 AGENT 任职`,
+        failedGateId: "G-ASSIGN",
       });
       return;
     }
@@ -3164,10 +3244,23 @@ class OrganizationService {
           actorRoleId: roleId,
           payload: { runId, invocationId, runtime: result.runtime || {}, usage: result.usage || null },
         });
+        const startedRun = this._requireMission(missionId).runs.find((item) => item.id === runId);
+        const requestedModel = normalizeText(startedRun?.model, 300);
+        const actualModel = normalizeText(result.runtime?.model, 300);
         this.ledger.append("run.completed", {
           missionId,
           actorRoleId: roleId,
-          payload: { runId, output: result.output, runtime: result.runtime || {}, usage: result.usage || null },
+          payload: {
+            runId,
+            output: result.output,
+            runtime: result.runtime || {},
+            usage: result.usage || null,
+            modelFidelity: {
+              requested: requestedModel,
+              actual: actualModel || null,
+              match: !actualModel || !requestedModel || actualModel === requestedModel,
+            },
+          },
         });
         runCompleted = true;
         onSuccess(this._requireMission(missionId), parsed, { id: runId, result });
@@ -3180,6 +3273,24 @@ class OrganizationService {
         const errorMessage = normalizeText(error?.message || String(error), 12_000);
         const currentStatus = this.mission(missionId)?.status;
         const terminal = TERMINAL_STATUSES.has(currentStatus);
+        if (active.superseded && !runCompleted) {
+          this.ledger.append("physical_invocation.interrupted", {
+            missionId,
+            actorRoleId: roleId,
+            payload: {
+              runId,
+              invocationId,
+              reason: "需求世代递增，旧世代物理调用被取代",
+              checkpointId: active.lastCheckpoint?.id || null,
+            },
+          });
+          this.ledger.append("run.superseded", {
+            missionId,
+            actorRoleId: roleId,
+            payload: { runId, revision: revision || null, currentRevision: this.mission(missionId)?.revision || null, error: "被新需求世代取代" },
+          });
+          return;
+        }
         if (active.stopRequested && !runCompleted) {
           this.ledger.append("physical_invocation.interrupted", {
             missionId,
@@ -3217,6 +3328,11 @@ class OrganizationService {
               roleId,
               runId,
               error: errorMessage || "紧急停止",
+              diagnosis: {
+                hypothesis: "人类主动紧急停止当前物理调用",
+                evidence: `runId=${runId}, invocationId=${invocationId}`,
+                neededFromHuman: "请人类决定下一步：恢复、改需求或取消",
+              },
             });
           }
           return;
@@ -3290,6 +3406,11 @@ class OrganizationService {
           roleId,
           runId,
           error: errorMessage,
+          diagnosis: {
+            hypothesis: runCompleted ? "角色输出未通过合同校验" : "模型调用失败或中断",
+            evidence: errorMessage,
+            neededFromHuman: runCompleted ? "请检查角色输出合同" : "请检查适配器与模型可用性",
+          },
         });
       })
       .finally(() => {
