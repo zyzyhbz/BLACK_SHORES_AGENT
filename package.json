@@ -6,7 +6,7 @@
   "scripts": {
     "setup": "node setup.js",
     "start": "node server.js",
-    "test": "node --test organization-core.test.js runtime-governance.test.js email-bridge.test.js server.test.js"
+    "test": "node --test organization-core.test.js runtime-governance.test.js email-bridge.test.js adapter-events.test.js server.test.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
