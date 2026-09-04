@@ -356,6 +356,8 @@ test("the workbench exposes every human-facing Mission control", () => {
     'data-action="device-package"',
     'data-action="device-evidence"',
     'data-action="quality-decision"',
+    'data-action="manage-projects"',
+    'name="project"',
     "data-workflow-profile",
     "externalEvidenceForm",
   ];
@@ -525,8 +527,7 @@ test("adapter probe detects executables and manifests manage versions over HTTP"
   assert.equal(list.manifests[0].version, "9.9.9");
 });
 
-test("decision inbox API creates and resolves Mission decisions", async (context) => {
-  const directory = tempDirectory();
+test("decision inbox API creates and resolves Mission decisions", async (context) => {  const directory = tempDirectory();
   const ledgerPath = path.join(directory, "ledger.jsonl");
   const ledger = new JsonlLedger(ledgerPath);
   ledger.append("mission.created", {
@@ -560,4 +561,37 @@ test("decision inbox API creates and resolves Mission decisions", async (context
   });
   assert.equal(resolveResponse.status, 200);
   assert.equal((await resolveResponse.json()).mission.decisions.at(-1).status, "approved");
+});
+
+test("project registry creates from workspace and archives over HTTP", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({ ledgerPath: path.join(directory, "ledger.jsonl"), worktree: directory });
+  context.after(() => stopServer(server.child));
+  const workspace = path.join(directory, "ws");
+  fs.mkdirSync(workspace);
+  fs.writeFileSync(path.join(workspace, "package.json"), JSON.stringify({ name: "ws", scripts: { test: "node --test" } }), "utf8");
+
+  const badResponse = await fetch(`${server.origin}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "坏目录", workingDirectory: path.join(directory, "missing") }),
+  });
+  assert.equal(badResponse.status, 400);
+
+  const createResponse = await fetch(`${server.origin}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "", workingDirectory: workspace }),
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  assert.equal(created.project.name, "ws");
+  assert.match(created.project.testCommand, /node --test/);
+
+  const registry = await (await fetch(`${server.origin}/api/projects`)).json();
+  assert.ok(registry.registry.some((item) => item.id === created.project.id && item.status === "active"));
+
+  const archiveResponse = await fetch(`${server.origin}/api/projects/${created.project.id}/archive`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  assert.equal(archiveResponse.status, 200);
+  assert.equal((await archiveResponse.json()).project.status, "archived");
 });
