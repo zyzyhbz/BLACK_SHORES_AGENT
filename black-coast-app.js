@@ -946,7 +946,7 @@ function decisionCard({ mission, decision }) {
       </div>
       <p>${escapeHtml(decision.facts || "暂无背景事实")}</p>
       ${decision.impacts ? `<p>影响：${escapeHtml(decision.impacts)}</p>` : ""}
-      ${(decision.options || []).length ? `<div class="work-item-list">${decision.options.map((option) => `<div class="work-item"><span>${escapeHtml(option)}</span></div>`).join("")}</div>` : ""}
+      ${(decision.options || []).length ? `<div class="work-item-list">${decision.options.map((option) => `<div class="work-item"><span class="work-state"></span><div><strong>${escapeHtml(option)}</strong></div><span></span></div>`).join("")}</div>` : ""}
       ${decision.recommendation ? `<p>建议：${escapeHtml(decision.recommendation)}</p>` : ""}
       ${decision.noDecisionConsequence ? `<p>不决策后果：${escapeHtml(decision.noDecisionConsequence)}</p>` : ""}
       ${decision.objectVersion ? `<div class="role-mode">对象版本 ${escapeHtml(decision.objectVersion)}</div>` : ""}
@@ -1023,7 +1023,7 @@ function renderBlockers() {
   return `
     <section class="page-section">
       <header class="section-heading"><div><span class="section-kicker">等待是等待，阻塞是阻塞</span><h2>阻塞与恢复</h2></div><button type="button" class="button button-secondary" data-action="new-waiting">${icon("plus")}记录等待</button></header>
-      ${(inspectionState?.findings || []).length ? `<div class="work-item-list"><div class="assignment-list-title"><strong>巡检发现（${inspectionState.findings.length}）</strong><span>停滞、缺证、逾期等待独立于执行持续检查</span></div>${inspectionState.findings.map((finding) => `<div class="work-item"><span><strong>${escapeHtml(finding.kind)}</strong> ${escapeHtml(finding.detail || "")}</span><small>${escapeHtml(finding.missionId || "")} · ${escapeHtml(finding.level || "")}</small></div>`).join("")}</div>` : ""}
+      ${(inspectionState?.findings || []).length ? `<div class="work-item-list"><div class="assignment-list-title"><strong>巡检发现（${inspectionState.findings.length}）</strong><span>停滞、缺证、逾期等待独立于执行持续检查</span></div>${inspectionState.findings.map((finding) => `<div class="work-item"><span class="work-state"></span><div><strong>${escapeHtml(finding.kind)}</strong><small>${escapeHtml(finding.detail || "")}</small></div><span><small>${escapeHtml(finding.missionId || "")} · ${escapeHtml(finding.level || "")}</small></span></div>`).join("")}</div>` : ""}
       <div class="assignment-list-title"><strong>真实阻塞（${openBlockers.length}）</strong><span>需要换路或升级，不会自动消失</span></div>
       ${openBlockers.length ? `<div class="role-grid">${openBlockers.map(({ mission, blocker }) => blockerCard(mission, blocker)).join("")}</div>` : '<div class="table-empty">无开放阻塞。</div>'}
       <div class="assignment-list-title"><strong>正常等待（${openWaiting.length}）</strong><span>不消耗模型调用，条件满足即关闭</span></div>
@@ -1031,11 +1031,14 @@ function renderBlockers() {
     </section>`;
 }
 
-function simpleList(title, items, renderItem) {
+function simpleList(title, items, renderRow) {
   return `
     <section class="inspector-section">
       <header><span>${escapeHtml(title)}</span><small>${items.length}</small></header>
-      ${items.length ? `<div class="work-item-list">${items.map(renderItem).join("")}</div>` : '<div class="quiet-empty">暂无</div>'}
+      ${items.length ? `<div class="work-item-list">${items.map((item) => {
+        const row = renderRow(item) || {};
+        return `<div class="work-item"><span class="work-state ${row.state ? `work-${escapeHtml(row.state)}` : ""}"></span><div><strong>${escapeHtml(row.title || "")}</strong>${row.subtitle ? `<small>${escapeHtml(row.subtitle)}</small>` : ""}</div><span>${row.action || ""}</span></div>`;
+      }).join("")}</div>` : '<div class="quiet-empty">暂无</div>'}
     </section>`;
 }
 
@@ -1062,20 +1065,20 @@ function renderQuality() {
       </header>
       <div class="workbench-grid">
         <section class="conversation-column">
-          ${simpleList("开放 GapCase", gapCases, ({ mission, gap }) => `<div class="work-item"><span><strong>${escapeHtml(gap.id)}</strong> ${escapeHtml(mission.title)}</span><small>${escapeHtml(gap.status)} · ${escapeHtml(gap.at || "")}</small></div>`)}
-          ${simpleList("VerifiedBaseline", baselines, ({ mission, baseline }) => `<div class="work-item"><span><strong>${escapeHtml(baseline.id || "")}</strong> ${escapeHtml(mission.title)}</span><small>候选 ${escapeHtml(baseline.candidateIdentity || "")}</small></div>`)}
-          ${simpleList("独立复核", reviews, ({ mission, review }) => `<div class="work-item"><span><strong>${escapeHtml(review.verdict || "")}</strong> ${escapeHtml(mission.title)}</span><small>${escapeHtml(review.at || "")}</small></div>`)}
-          ${simpleList("测试运行", testRuns, ({ mission, run }) => `<div class="work-item"><span><strong>${escapeHtml(run.verdict || "")}</strong> ${escapeHtml(mission.title)}</span><small>清单 ${escapeHtml(run.projectTestManifestVersion || "")}</small></div>`)}
-          ${simpleList("轻度 ChangeRecord", changes, ({ mission, record }) => `<div class="work-item"><span><strong>${escapeHtml(record.id || "")}</strong> ${escapeHtml(mission.title)}</span><small>留痕复核通过，非全量验证</small></div>`)}
+          ${simpleList("开放 GapCase", gapCases, ({ mission, gap }) => ({ title: gap.id, subtitle: `${mission.title} · ${gap.status} · ${gap.at || ""}` }))}
+          ${simpleList("VerifiedBaseline", baselines, ({ mission, baseline }) => ({ title: baseline.id || "", subtitle: `${mission.title} · 候选 ${baseline.candidateIdentity || ""}` }))}
+          ${simpleList("独立复核", reviews, ({ mission, review }) => ({ title: `${review.verdict || ""} · ${mission.title}`, subtitle: review.at || "" }))}
+          ${simpleList("测试运行", testRuns, ({ mission, run }) => ({ title: `${run.verdict || ""} · ${mission.title}`, subtitle: `清单 ${run.projectTestManifestVersion || ""}` }))}
+          ${simpleList("轻度 ChangeRecord", changes, ({ mission, record }) => ({ title: `${record.id || ""} · ${mission.title}`, subtitle: "留痕复核通过，非全量验证" }))}
         </section>
         <aside class="mission-inspector">
-          ${simpleList("紧急绕过", overrides, ({ mission, override }) => `<div class="work-item"><span><strong>${escapeHtml(override.id)}</strong> ${escapeHtml((override.overriddenGates || []).join("、"))}</span><small>${escapeHtml(override.status)} · 到期 ${escapeHtml(override.expiresAt || "")}</small></div>`)}
-          ${simpleList("风险债务", debts, ({ mission, debt }) => `<div class="work-item"><span><strong>${escapeHtml(debt.id)}</strong> ${escapeHtml((debt.description || "").slice(0, 40))}</span><small>${escapeHtml(debt.status)}</small></div>`)}
-          ${simpleList("真机执行包", packages, ({ mission, devicePackage }) => `<div class="work-item"><span><strong>${escapeHtml(devicePackage.id)}</strong> ${escapeHtml(devicePackage.buildIdentity || "")}</span><small>${escapeHtml(devicePackage.status)}</small></div>`)}
-          ${simpleList("项目测试集", manifests, (manifest) => `<div class="work-item"><span><strong>${escapeHtml(manifest.id)}</strong> v${escapeHtml(manifest.version)}</span><small>${escapeHtml(manifest.projectId)} · ${manifest.deprecated ? "已废弃" : "生效中"} · ${(manifest.requiredTests || []).length} 必跑项</small></div>`)}
+          ${simpleList("紧急绕过", overrides, ({ mission, override }) => ({ title: `${override.id} · ${mission.title}`, subtitle: `${(override.overriddenGates || []).join("、")} · ${override.status} · 到期 ${override.expiresAt || ""}` }))}
+          ${simpleList("风险债务", debts, ({ mission, debt }) => ({ title: `${debt.id} · ${mission.title}`, subtitle: `${(debt.description || "").slice(0, 40)} · ${debt.status}` }))}
+          ${simpleList("真机执行包", packages, ({ mission, devicePackage }) => ({ title: `${devicePackage.id} · ${mission.title}`, subtitle: `${devicePackage.buildIdentity || ""} · ${devicePackage.status}` }))}
+          ${simpleList("项目测试集", manifests, (manifest) => ({ title: `${manifest.id} v${manifest.version}`, subtitle: `${manifest.projectId} · ${manifest.deprecated ? "已废弃" : "生效中"} · ${(manifest.requiredTests || []).length} 必跑项` }))}
           <section class="inspector-section">
             <header><span>动作留痕与撤销</span><small>${roleActions.length}</small></header>
-            <div class="work-item-list">${roleActions.map((event) => `<div class="work-item"><span><strong>${escapeHtml(event.payload?.actionId || event.id)}</strong> ${escapeHtml(event.actorRoleId)}</span><span><small>${escapeHtml(event.payload?.backupArchive ? "有备份" : "无备份")}</small> <button type="button" class="button button-secondary" data-action="revert-action" data-action-id="${escapeHtml(event.payload?.actionId || "")}" ${requestInFlight ? "disabled" : ""}>撤销</button></span></div>`).join("") || '<div class="quiet-empty">暂无</div>'}</div>
+            <div class="work-item-list">${roleActions.map((event) => `<div class="work-item"><span class="work-state"></span><div><strong>${escapeHtml(event.payload?.actionId || event.id)}</strong><small>${escapeHtml(event.actorRoleId)} · ${escapeHtml(event.payload?.backupArchive ? "有备份" : "无备份")}</small></div><span><button type="button" class="button button-secondary" data-action="revert-action" data-action-id="${escapeHtml(event.payload?.actionId || "")}" ${requestInFlight ? "disabled" : ""}>撤销</button></span></div>`).join("") || '<div class="quiet-empty">暂无</div>'}</div>
           </section>
         </aside>
       </div>
@@ -1092,8 +1095,8 @@ function renderCognition() {
         <section class="inspector-section">
           <header><span>${escapeHtml(decisionCase.title)}</span><small>${escapeHtml(mission.title)} · Owner ${escapeHtml(decisionCase.ownerRoleId || "")} · ${escapeHtml(decisionCase.status)}</small></header>
           <p>${escapeHtml(decisionCase.context || "")}</p>
-          ${(decisionCase.ideaSets || []).map((idea) => `<div class="work-item-list"><div class="assignment-list-title"><strong>IdeaSet</strong><span>${escapeHtml(idea.id)}</span></div>${(idea.clusters || []).map((cluster) => `<div class="work-item"><span>${escapeHtml(cluster)}</span></div>`).join("")}</div>`).join("")}
-          ${(decisionCase.briefs || []).map((brief) => `<div class="work-item-list"><div class="assignment-list-title"><strong>DecisionBrief · 建议 ${escapeHtml(brief.recommendation || "")}</strong><span>置信度 ${escapeHtml(brief.confidence || "")}</span></div><div class="work-item"><span>候选：${escapeHtml((brief.candidates || []).join(" / "))}</span></div>${(brief.minorityOpinions || []).map((opinion) => `<div class="work-item"><span>少数意见：${escapeHtml(opinion)}</span></div>`).join("")}</div>`).join("")}
+          ${(decisionCase.ideaSets || []).map((idea) => `<div class="work-item-list"><div class="assignment-list-title"><strong>IdeaSet</strong><span>${escapeHtml(idea.id)}</span></div>${(idea.clusters || []).map((cluster) => `<div class="work-item"><span class="work-state"></span><div><strong>${escapeHtml(cluster)}</strong></div><span></span></div>`).join("")}</div>`).join("")}
+          ${(decisionCase.briefs || []).map((brief) => `<div class="work-item-list"><div class="assignment-list-title"><strong>DecisionBrief · 建议 ${escapeHtml(brief.recommendation || "")}</strong><span>置信度 ${escapeHtml(brief.confidence || "")}</span></div><div class="work-item"><span class="work-state"></span><div><strong>候选：${escapeHtml((brief.candidates || []).join(" / "))}</strong></div><span></span></div>${(brief.minorityOpinions || []).map((opinion) => `<div class="work-item"><span class="work-state"></span><div><strong>少数意见：${escapeHtml(opinion)}</strong></div><span></span></div>`).join("")}</div>`).join("")}
           ${decisionCase.status === "open" ? `<div class="decision-actions">
             <button type="button" class="button button-secondary" data-action="new-idea" data-mission-id="${escapeHtml(mission.id)}" data-case-id="${escapeHtml(decisionCase.id)}">补创意</button>
             <button type="button" class="button button-secondary" data-action="new-brief" data-mission-id="${escapeHtml(mission.id)}" data-case-id="${escapeHtml(decisionCase.id)}">写简报</button>
@@ -1132,11 +1135,11 @@ function renderKnowledge() {
       <header class="section-heading"><div><span class="section-kicker">结构、来源、技能</span><h2>信息与技能</h2></div><button type="button" class="button button-secondary" data-action="new-skill">${icon("plus")}登记技能候选</button></header>
       <div class="workbench-grid">
         <section class="conversation-column">
-          ${simpleList("技能目录", skills, ({ mission, skill }) => `<div class="work-item"><span><strong>${escapeHtml(skill.name || skill.id)}</strong> ${escapeHtml((skill.description || "").slice(0, 60))}</span><span><small>${escapeHtml(skill.status)}</small> ${skill.status === "candidate" ? `<button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="published">发布</button> <button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="deprecated">废弃</button>` : ""}</span></div>`)}
-          ${simpleList("项目测试集", manifests, (manifest) => `<div class="work-item"><span><strong>${escapeHtml(manifest.id)}</strong> v${escapeHtml(manifest.version)}</span><small>${escapeHtml(manifest.projectId)} · ${manifest.deprecated ? "已废弃" : "生效中"}</small></div>`)}
+          ${simpleList("技能目录", skills, ({ mission, skill }) => ({ title: `${skill.name || skill.id} · ${mission.title}`, subtitle: `${(skill.description || "").slice(0, 60)} · ${skill.status}`, action: skill.status === "candidate" ? `<button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="published">发布</button> <button type="button" class="button button-secondary" data-action="decide-skill" data-mission-id="${escapeHtml(mission.id)}" data-skill-id="${escapeHtml(skill.id)}" data-decision="deprecated">废弃</button>` : "" }))}
+          ${simpleList("项目测试集", manifests, (manifest) => ({ title: `${manifest.id} v${manifest.version}`, subtitle: `${manifest.projectId} · ${manifest.deprecated ? "已废弃" : "生效中"}` }))}
         </section>
         <aside class="mission-inspector">
-          ${simpleList("任职快照", snapshots, (snapshot) => `<div class="work-item"><span><strong>${escapeHtml(snapshot.id || snapshot.payload?.id || "")}</strong></span><small>${escapeHtml(snapshot.at || "")}</small></div>`)}
+          ${simpleList("任职快照", snapshots, (snapshot) => ({ title: snapshot.id || snapshot.payload?.id || "", subtitle: snapshot.at || "" }))}
         </aside>
       </div>
     </section>`;
@@ -1879,7 +1882,7 @@ function openProjectDialog() {
   const projects = organizationState?.projects || [];
   detailContent.innerHTML = `
     <header class="dialog-header"><div><span class="section-kicker">项目由人类管理</span><h2>项目管理</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭" title="关闭">${icon("x")}</button></header>
-    <div class="work-item-list">${projects.map((project) => `<div class="work-item"><span><strong>${escapeHtml(project.name || project.id)}</strong><small>${escapeHtml(project.workingDirectory || "")}</small></span><span><small>${escapeHtml(project.status || "active")}</small> ${project.status === "archived"
+    <div class="work-item-list">${projects.map((project) => `<div class="work-item"><span class="work-state ${project.status === "archived" ? "" : "work-completed"}"></span><div><strong>${escapeHtml(project.name || project.id)}</strong><small>${escapeHtml(project.workingDirectory || "")} · ${escapeHtml(project.status || "active")}</small></div><span>${project.status === "archived"
       ? `<button type="button" class="button button-secondary" data-project-action="reopen" data-project-id="${escapeHtml(project.id)}">重开</button>`
       : `<button type="button" class="button button-secondary" data-project-action="archive" data-project-id="${escapeHtml(project.id)}">归档</button>`}</span></div>`).join("") || '<div class="quiet-empty">暂无</div>'}</div>
     <form class="agent-config-form" id="projectCreateForm">
