@@ -1059,7 +1059,8 @@ class OrganizationService {
       if (remote.status === 0) discovered.repository = String(remote.stdout || "").trim().slice(0, 500);
     } catch {}
     try {
-      const manifest = JSON.parse(fs.readFileSync(path.join(workingDirectory, "package.json"), "utf8"));
+      const raw = fs.readFileSync(path.join(workingDirectory, "package.json"), "utf8").replace(/^﻿/, "");
+      const manifest = JSON.parse(raw);
       if (manifest?.name) discovered.name = String(manifest.name).slice(0, 200);
       if (manifest?.scripts?.test) discovered.testCommand = `npm test (${String(manifest.scripts.test).slice(0, 200)})`;
     } catch {}
