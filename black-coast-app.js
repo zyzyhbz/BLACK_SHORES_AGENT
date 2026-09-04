@@ -1689,8 +1689,41 @@ async function submitOverride(event) {
   }
 }
 
-function openWaitingDialog(missionId) {
-  openFormDialog("阻塞与恢复", "记录正常等待", "waitingForm", `
+function openRetryDialog(missionId) {
+  openFormDialog("阻塞与恢复", "有限恢复（须声明假设）", "retryForm", `
+    <input type="hidden" name="missionId" value="${escapeHtml(missionId || activeMission()?.id || "")}" />
+    <label class="field-label form-span"><span>本轮根因假设（必填；与上次相同且不换路会被门禁拦截）</span><textarea name="hypothesis" rows="2" required></textarea></label>
+    <label class="field-label"><span>换路适配器（可选）</span><input type="text" name="adapterId" placeholder="留空表示沿用" /></label>
+    <label class="field-label"><span>换路模型（可选）</span><input type="text" name="model" placeholder="留空表示沿用" /></label>
+    <label class="field-label"><span>换路推理强度（可选）</span><input type="text" name="reasoningEffort" placeholder="留空表示沿用" /></label>`, "在预算内恢复");
+  document.getElementById("retryForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (requestInFlight) return;
+    const form = new FormData(event.currentTarget);
+    requestInFlight = true;
+    try {
+      const assignment = form.get("adapterId") ? {
+        adapterId: form.get("adapterId"),
+        model: form.get("model"),
+        reasoningEffort: form.get("reasoningEffort"),
+      } : null;
+      await api(`/api/organization/missions/${encodeURIComponent(form.get("missionId"))}/retry`, {
+        method: "POST",
+        body: JSON.stringify({ hypothesis: form.get("hypothesis"), assignment }),
+      });
+      detailDialog.close();
+      showToast("已在恢复预算内重新任职");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      requestInFlight = false;
+      renderCurrentView();
+    }
+  });
+}
+
+function openWaitingDialog(missionId) {  openFormDialog("阻塞与恢复", "记录正常等待", "waitingForm", `
     ${missionField(missionId || activeMission()?.id)}
     <label class="field-label form-span"><span>等待原因</span><textarea name="reason" rows="2" required></textarea></label>
     <label class="field-label"><span>责任角色</span><input type="text" name="responsibleRoleId" value="chief-manager" /></label>
@@ -2333,8 +2366,9 @@ async function missionAction(action, dataset = {}) {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/confirm-baseline`, { method: "POST" });
       showToast("需求基线已确认，群星的调律者开始组织规划");
     } else if (action === "retry") {
-      await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/retry`, { method: "POST" });
-      showToast("已在恢复预算内重新任职");
+      requestInFlight = false;
+      renderCurrentView();
+      openRetryDialog(dataset.missionId);
     } else if (action === "start-heavy-review") {
       await api(`/api/organization/missions/${encodeURIComponent(mission.id)}/start-heavy-review`, { method: "POST" });
       showToast("重度全量回顾已启动");

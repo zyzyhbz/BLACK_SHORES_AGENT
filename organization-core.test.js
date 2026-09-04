@@ -320,7 +320,11 @@ test("finite recovery closes the old blocker and counts attempts across retries"
   await settle(service);
   service.retry(mission.id);
   await settle(service);
-  service.retry(mission.id);
+  assert.throws(() => service.retry(mission.id), /更换任职|升级/);
+  service.retry(mission.id, {
+    hypothesis: "切换适配器后重试",
+    assignment: { adapterId: "codex", model: "m", reasoningEffort: "high" },
+  });
   await settle(service);
 
   const updated = service.mission(mission.id);
@@ -398,6 +402,7 @@ test("release source, merge, deployment, external evidence and acceptance are di
     notes: "外部验收环境通过",
   });
   assert.equal(service.mission(mission.id).status, "awaiting_result_acceptance");
+  service.decideQuality(mission.id, { verdict: "passed", basis: "复核与全量测试证据齐全", decidedBy: "human-owner" });
   service.acceptResult(mission.id);
 
   const accepted = service.mission(mission.id);
@@ -1434,7 +1439,7 @@ test("projects are created from a workspace and archived only when quiet", async
 
 test("gate registry names every rejection with evidence and owner", async () => {
   const { GATE_REGISTRY } = require("./organization-core");
-  assert.equal(GATE_REGISTRY.length, 13);
+  assert.equal(GATE_REGISTRY.length, 15);
   for (const gate of GATE_REGISTRY) {
     assert.ok(/^G-[A-Z-]+$/.test(gate.id));
     for (const field of ["name", "checks", "evidence", "owner", "failResult"]) {
@@ -1495,4 +1500,118 @@ test("usage never overwrites the current action and details reach checkpoints", 
   assert.equal(checkpoint.payload.summary, "执行工具：pnpm test");
   assert.match(checkpoint.payload.detail, /pnpm test/);
   service.requestSafePause(mission.id);
+});
+
+test("blocker declaration cites a gate or a structured diagnosis", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("验证阻塞声明门禁");
+  await settle(service);
+  assert.throws(() => service._openBlocker(mission.id, {
+    category: "vague", roleId: "engineering", error: "不行",
+  }), /G-BLOCK-DECLARE/);
+  assert.throws(() => service._openBlocker(mission.id, {
+    category: "vague", roleId: "engineering", error: "不行",
+    diagnosis: { hypothesis: "猜", evidence: "无" },
+  }), /G-BLOCK-DECLARE/);
+  assert.throws(() => service._openBlocker(mission.id, {
+    category: "waiting-like", roleId: "engineering", error: "等一会",
+    diagnosis: { hypothesis: "等外部排期", evidence: "对方说明天给" },
+    expectedAt: new Date(Date.now() + 3600000).toISOString(),
+  }), /等待条件/);
+  const blockerId = service._openBlocker(mission.id, {
+    category: "real-block",
+    roleId: "engineering",
+    error: "构建失败",
+    diagnosis: { hypothesis: "依赖版本冲突", evidence: "pnpm install ERESOLVE", neededFromHuman: "确认锁文件策略" },
+  });
+  const opened = service.mission(mission.id).blockers.find((item) => item.id === blockerId);
+  assert.equal(opened.hypothesis, "依赖版本冲突");
+});
+
+test("recovery changes path or escalates on repeated hypotheses", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => { throw new Error("model unavailable"); },
+  });
+  const mission = service.createMission("验证恢复换路规则");
+  await settle(service);
+  assert.equal(service.mission(mission.id).status, "blocked");
+  service.retry(mission.id, {});
+  await settle(service);
+  const second = service.mission(mission.id);
+  assert.equal(second.status, "blocked");
+  assert.throws(() => service.retry(mission.id, {}), /更换任职|升级/);
+  const moved = service.retry(mission.id, {
+    hypothesis: "切换任职到 codex 重试",
+    assignment: { adapterId: "codex", model: "m", reasoningEffort: "high" },
+  });
+  assert.ok(moved);
+});
+
+test("revision bump supersedes in-flight runs instead of failing", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-supersede",
+    payload: { title: "世代取代", goal: "验证旧世代自动取代", workflowProfile: "light" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-supersede",
+    payload: { from: "intake", to: "waiting", reason: "等待修改" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ signal }) => new Promise((resolve, reject) => {
+      if (signal.aborted) reject(Object.assign(new Error("stopped"), { code: "STOP" }));
+      else signal.addEventListener("abort", () => reject(Object.assign(new Error("stopped"), { code: "STOP" })), { once: true });
+    }),
+  });
+  service._queueRequirementRun("mission-supersede");
+  const revised = service.reviseRequirements("mission-supersede", "改需求并取代旧世代");
+  assert.equal(revised.revision, 2);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const runs = service.mission("mission-supersede").runs;
+  assert.ok(runs.some((run) => run.status === "superseded"));
+  assert.ok(runs.some((run) => run.status === "running"));
+  service.requestSafePause("mission-supersede");
+  await settle(service);
+  assert.equal(service.mission("mission-supersede").status, "waiting");
+});
+
+test("acceptance requires a passed quality decision", async () => {
+  const { directory, ledger } = tempLedger();
+  ledger.append("mission.created", {
+    missionId: "mission-quality-gate",
+    payload: { title: "质量门禁", goal: "验证验收要求质量判定", workflowProfile: "heavy" },
+  });
+  ledger.append("release_candidate.created", {
+    missionId: "mission-quality-gate",
+    actorRoleId: "chief-manager",
+    payload: { id: "rc-1", digest: "digest-1" },
+  });
+  ledger.append("external_evidence.recorded", {
+    missionId: "mission-quality-gate",
+    actorRoleId: "human-owner",
+    payload: { candidateId: "rc-1", candidateDigest: "digest-1", buildIdentity: "build-1", result: "passed" },
+  });
+  ledger.append("mission.status_changed", {
+    missionId: "mission-quality-gate",
+    payload: { from: "intake", to: "awaiting_result_acceptance", reason: "待验收" },
+  });
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => { throw new Error("unused"); },
+  });
+  assert.throws(() => service.acceptResult("mission-quality-gate"), /G-QUALITY/);
+  service.decideQuality("mission-quality-gate", { verdict: "passed", basis: "复核与测试证据齐全", decidedBy: "human-owner" });
+  const accepted = service.acceptResult("mission-quality-gate");
+  assert.equal(accepted.status, "accepted");
 });
