@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 
 const SYSTEM_VERSION = "0.8.0-mvp";
 const PROJECT_ID = "project-default";
@@ -870,7 +871,7 @@ class OrganizationService {
         ROLE_DEFINITIONS.map((role) => [role.id, this._assignmentForRole(role.id)]),
       ),
       project: this.project,
-      projects: Object.values(this.projects),
+      projects: this._projectRegistry(),
       projectTestManifest: this.projectTestManifest,
       projectTestManifests: this.ledger.events()
         .filter((event) => event.type === "test_manifest.published")
@@ -1024,9 +1025,95 @@ class OrganizationService {
     return { id: manifestId, deprecated: true };
   }
 
+  _projectRegistry() {
+    const registered = new Map();
+    for (const event of this.ledger.events()) {
+      if (event.type === "project.registered") {
+        registered.set(event.payload.id, { status: "active", registeredAt: event.at, ...event.payload });
+      } else if (event.type === "project.archived" && registered.has(event.payload.id)) {
+        registered.get(event.payload.id).status = "archived";
+      } else if (event.type === "project.reopened" && registered.has(event.payload.id)) {
+        registered.get(event.payload.id).status = "active";
+      }
+    }
+    return [...Object.values(this.projects).map((item) => ({ status: "active", builtin: true, ...item })), ...registered.values()];
+  }
+
   _projectFor(mission) {
     const target = mission?.targetProjectId || mission?.projectId;
-    return this.projects[target] || this.project;
+    const registry = this._projectRegistry();
+    return registry.find((item) => item.id === target && item.status !== "archived")
+      || this.projects[target]
+      || this.project;
+  }
+
+  _discoverProject(workingDirectory) {
+    const discovered = { repository: "", name: "", testCommand: "" };
+    try {
+      const remote = spawnSync("git", ["remote", "get-url", "origin"], {
+        cwd: workingDirectory,
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 10_000,
+      });
+      if (remote.status === 0) discovered.repository = String(remote.stdout || "").trim().slice(0, 500);
+    } catch {}
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(workingDirectory, "package.json"), "utf8"));
+      if (manifest?.name) discovered.name = String(manifest.name).slice(0, 200);
+      if (manifest?.scripts?.test) discovered.testCommand = `npm test (${String(manifest.scripts.test).slice(0, 200)})`;
+    } catch {}
+    return discovered;
+  }
+
+  publishProject(input) {
+    assertObject(input, "项目定义");
+    const workingDirectory = path.resolve(normalizeText(input.workingDirectory, 2000));
+    if (!workingDirectory) throw Object.assign(new Error("定义项目只需要指定初始工作空间"), { statusCode: 400 });
+    if (!fs.existsSync(workingDirectory) || !fs.statSync(workingDirectory).isDirectory()) {
+      throw Object.assign(new Error("初始工作空间不存在或不是目录"), { statusCode: 400 });
+    }
+    const discovered = this._discoverProject(workingDirectory);
+    const id = makeId("proj");
+    this.ledger.append("project.registered", {
+      actorRoleId: "human-owner",
+      payload: {
+        id,
+        name: normalizeText(input.name, 200) || discovered.name || path.basename(workingDirectory),
+        workingDirectory,
+        repository: normalizeText(input.repository, 500) || discovered.repository,
+        testCommand: normalizeText(input.testCommand, 500) || discovered.testCommand,
+        sourceRef: normalizeText(input.sourceRef, 200) || "origin/main",
+      },
+    });
+    return this._projectRegistry().find((item) => item.id === id);
+  }
+
+  archiveProject(projectId, input = {}) {
+    const registry = this._projectRegistry();
+    const target = registry.find((item) => item.id === projectId);
+    if (!target) throw Object.assign(new Error("项目不存在"), { statusCode: 404 });
+    if (target.status === "archived") throw Object.assign(new Error("项目已归档"), { statusCode: 409 });
+    const activeMissions = this.state().missions.filter(
+      (mission) => (mission.targetProjectId || mission.projectId) === projectId && !TERMINAL_STATUSES.has(mission.status),
+    );
+    if (activeMissions.length) {
+      throw Object.assign(new Error(`项目下还有 ${activeMissions.length} 个未终结会话，不能归档`), { statusCode: 409 });
+    }
+    this.ledger.append("project.archived", {
+      actorRoleId: "human-owner",
+      payload: { id: projectId, reason: normalizeText(input.reason, 2000) || "人类归档" },
+    });
+    return this._projectRegistry().find((item) => item.id === projectId);
+  }
+
+  reopenProject(projectId) {
+    const registry = this._projectRegistry();
+    const target = registry.find((item) => item.id === projectId);
+    if (!target) throw Object.assign(new Error("项目不存在"), { statusCode: 404 });
+    if (target.status !== "archived") throw Object.assign(new Error("项目未归档，无需重开"), { statusCode: 409 });
+    this.ledger.append("project.reopened", { actorRoleId: "human-owner", payload: { id: projectId } });
+    return this._projectRegistry().find((item) => item.id === projectId);
   }
 
   _manifestFor(mission) {
@@ -1139,8 +1226,10 @@ class OrganizationService {
     const missionId = makeId("mission");
     const profile = resolveWorkflowProfile(workflowProfile, normalizedGoal);
     const target = normalizeText(targetProjectId, 200);
-    if (target && !this.projects[target]) {
-      throw Object.assign(new Error(`未知目标项目：${target}`), { statusCode: 400 });
+    if (target) {
+      const registered = this._projectRegistry().find((item) => item.id === target);
+      if (!registered) throw Object.assign(new Error(`未知目标项目：${target}`), { statusCode: 400 });
+      if (registered.status === "archived") throw Object.assign(new Error("目标项目已归档，请重开后再建会话"), { statusCode: 409 });
     }
     this.ledger.append("mission.created", {
       missionId,

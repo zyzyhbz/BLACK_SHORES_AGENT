@@ -2002,7 +2002,31 @@ const server = http.createServer(async (request, response) => {
     sendJson(response, 200, {
       active: { id: appConfig.project.id, name: appConfig.project.name, status: "active" },
       inactive: appConfig.inactiveProjects,
+      registry: organization.state().projects,
     });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/projects") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { project: organization.publishProject(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const projectActionMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/(archive|reopen)$/);
+  if (request.method === "POST" && projectActionMatch) {
+    try {
+      const payload = await readJsonBody(request).catch(() => ({}));
+      const projectId = decodeURIComponent(projectActionMatch[1]);
+      if (projectActionMatch[2] === "archive") sendJson(response, 200, { project: organization.archiveProject(projectId, payload) });
+      else sendJson(response, 200, { project: organization.reopenProject(projectId) });
+    } catch (error) {
+      organizationError(response, error);
+    }
     return;
   }
 
