@@ -1513,8 +1513,20 @@ function runAdapterBuffered(
 
 const organizationLedger = new JsonlLedger(
   appConfig.ledger.path,
-  { projectId: appConfig.project.id },
+  { projectId: appConfig.project.id, onAppend: () => broadcastStream() },
 );
+const streamClients = new Set();
+function broadcastStream() {
+  if (!streamClients.size) return;
+  const payload = `data: ${JSON.stringify({ eventCount: organizationLedger.events().length, activeRuns: organization.activeRuns.size, at: new Date().toISOString() })}\n\n`;
+  for (const response of [...streamClients]) {
+    try {
+      response.write(payload);
+    } catch {
+      streamClients.delete(response);
+    }
+  }
+}
 const organizationProject = {
   id: appConfig.project.id,
   name: appConfig.project.name,
@@ -1712,6 +1724,21 @@ const server = http.createServer(async (request, response) => {
       },
       governance: runtimeGovernance.status(),
       channels: { email: emailBridge.publicState() },
+    });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/organization/stream") {
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    response.write(`data: ${JSON.stringify({ eventCount: organizationLedger.events().length, activeRuns: organization.activeRuns.size, at: new Date().toISOString() })}\n\n`);
+    streamClients.add(response);
+    request.on("close", () => {
+      streamClients.delete(response);
     });
     return;
   }

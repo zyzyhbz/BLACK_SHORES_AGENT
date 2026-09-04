@@ -2460,10 +2460,45 @@ detailDialog.addEventListener("click", (event) => {
 
 handleViewportChange();
 refreshState();
-pollTimer = setInterval(() => {
-  const hasActiveRun = Boolean(organizationState?.activeRunIds?.length);
-  const emailEnabled = emailState?.enabled === true;
-  if ((hasActiveRun || emailEnabled) && !requestInFlight && !tunerInFlight && !emailRequestInFlight) {
+let streamSource = null;
+let streamSignature = "";
+function streamRefresh(payload) {
+  const signature = `${payload?.eventCount ?? ""}:${payload?.activeRuns ?? ""}`;
+  if (streamSignature && signature === streamSignature) return;
+  streamSignature = signature;
+  const typing = imeComposing
+    || (document.activeElement instanceof HTMLTextAreaElement && document.activeElement.id === "commandInput");
+  if (typing) {
+    refreshDeferred = true;
+    return;
+  }
+  if (!requestInFlight && !tunerInFlight && !emailRequestInFlight) refreshState({ quiet: true });
+}
+function connectStream() {
+  if (typeof EventSource === "undefined") {
+    pollTimer = setInterval(() => refreshState({ quiet: true }), 15000);
+    return;
+  }
+  try {
+    streamSource?.close();
+    streamSource = new EventSource("/api/organization/stream");
+    streamSource.onmessage = (event) => {
+      try {
+        streamRefresh(JSON.parse(event.data));
+      } catch {}
+    };
+    streamSource.onerror = () => {
+      streamSource?.close();
+      streamSource = null;
+      pollTimer = setInterval(() => refreshState({ quiet: true }), 15000);
+    };
+  } catch {
+    pollTimer = setInterval(() => refreshState({ quiet: true }), 15000);
+  }
+}
+connectStream();
+if (!pollTimer) {
+  pollTimer = setInterval(() => {
     const typing = imeComposing
       || (document.activeElement instanceof HTMLTextAreaElement && document.activeElement.id === "commandInput");
     if (typing) {
@@ -2471,7 +2506,10 @@ pollTimer = setInterval(() => {
       return;
     }
     refreshState({ quiet: true });
-  }
-}, 3500);
+  }, 60000);
+}
 
-window.addEventListener("beforeunload", () => clearInterval(pollTimer));
+window.addEventListener("beforeunload", () => {
+  clearInterval(pollTimer);
+  streamSource?.close();
+});

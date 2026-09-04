@@ -267,9 +267,10 @@ function assertObject(value, label) {
 }
 
 class JsonlLedger {
-  constructor(filePath, { projectId = PROJECT_ID } = {}) {
+  constructor(filePath, { projectId = PROJECT_ID, onAppend = null } = {}) {
     this.filePath = path.resolve(filePath);
     this.projectId = projectId;
+    this.onAppend = typeof onAppend === "function" ? onAppend : null;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     if (!fs.existsSync(this.filePath)) fs.writeFileSync(this.filePath, "", "utf8");
     this._events = this._load();
@@ -309,6 +310,11 @@ class JsonlLedger {
     }
     fs.appendFileSync(this.filePath, `${serialized}\n`, "utf8");
     this._events.push(event);
+    if (this.onAppend) {
+      try {
+        this.onAppend(event);
+      } catch {}
+    }
     return event;
   }
 
