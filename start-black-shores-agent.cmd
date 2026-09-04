@@ -1,3 +1,3 @@
 @echo off
-powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0launch-black-shores-agent.ps1"
+wscript.exe "%~dp0start-black-shores-agent-hidden.vbs"
 exit /b %ERRORLEVEL%
