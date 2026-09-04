@@ -1279,8 +1279,7 @@ test("every work item has exactly one responsible role", async () => {
   }
 });
 
-test("recording waiting consumes no model runs", async () => {
-  const { directory, ledger } = tempLedger();
+test("recording waiting consumes no model runs", async () => {  const { directory, ledger } = tempLedger();
   ledger.append("mission.created", {
     missionId: "mission-wait-quiet",
     payload: { title: "等待任务", goal: "验证等待不消耗模型", workflowProfile: "light" },
@@ -1298,4 +1297,33 @@ test("recording waiting consumes no model runs", async () => {
   assert.equal(updated.waitingConditions.length, 1);
   assert.equal(service.activeRuns.size, 0);
   assert.equal(updated.runs.length, 0);
+});
+
+test("model outputs are not silently truncated by count, only bounded by size", async () => {
+  const { directory, ledger } = tempLedger();
+  const questions = Array.from({ length: 12 }, (_, index) => ({ id: `q${index}`, question: `问题${index}`, why: "覆盖" }));
+  const workItems = Array.from({ length: 10 }, (_, index) => ({ title: `工作${index}`, ownerRoleId: index % 2 ? "engineering" : "independent-reviewer", deliverable: "交付", acceptance: [] }));
+  let requirementCalls = 0;
+  const baseline = { outcome: "做事", inScope: ["全"], outOfScope: [], acceptanceCriteria: ["成"], testRequirements: [], constraints: [], knownFacts: [], openRisks: [] };
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async ({ role }) => {
+      if (role.id === "requirements-lead") {
+        requirementCalls += 1;
+        if (requirementCalls === 1) return { output: JSON.stringify({ readyForBaseline: false, message: "请回答", questions }) };
+        return { output: JSON.stringify({ readyForBaseline: true, message: "基线", questions: [], baseline }) };
+      }
+      return { output: JSON.stringify({ message: "计划", charter: { outcome: "做事", scope: ["全"], constraints: [], successEvidence: [], escalationConditions: [] }, workItems }) };
+    },
+  });
+  const mission = service.createMission("验证数量截断已放开");
+  await settle(service);
+  assert.equal(service.mission(mission.id).messages.at(-1).questions.length, 12);
+  service.addHumanMessage(mission.id, "补充全部十二个问题的答案");
+  await settle(service);
+  service.confirmBaseline(mission.id);
+  await settle(service);
+  assert.equal(service.mission(mission.id).workItems.length, 10);
+  assert.throws(() => ledger.append("oversize.probe", { payload: { blob: "x".repeat(300 * 1024) } }), /256 KB/);
 });

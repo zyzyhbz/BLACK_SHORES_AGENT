@@ -283,8 +283,7 @@ class JsonlLedger {
 
   append(type, fields = {}) {
     const event = {
-      id: makeId("evt"),
-      type,
+      id: makeId("evt"),      type,
       at: nowIso(),
       projectId: fields.projectId || this.projectId,
       missionId: fields.missionId || null,
@@ -292,7 +291,11 @@ class JsonlLedger {
       causationId: fields.causationId || null,
       payload: fields.payload || {},
     };
-    fs.appendFileSync(this.filePath, `${JSON.stringify(event)}\n`, "utf8");
+    const serialized = JSON.stringify(event);
+    if (serialized.length > 256 * 1024) {
+      throw new Error(`账本事件超过 256 KB 上限（${type}），拒绝写入以保护账本`);
+    }
+    fs.appendFileSync(this.filePath, `${serialized}\n`, "utf8");
     this._events.push(event);
     return event;
   }
@@ -1588,8 +1591,8 @@ class OrganizationService {
         version,
         buildIdentity,
         commit: normalizeText(input.commit, 100) || mission.releaseCandidate.headCommit || null,
-        devices: Array.isArray(input.devices) ? input.devices.map((item) => normalizeText(item, 300)).filter(Boolean).slice(0, 20) : [],
-        preconditions: Array.isArray(input.preconditions) ? input.preconditions.map((item) => normalizeText(item, 1000)).filter(Boolean).slice(0, 20) : [],
+        devices: Array.isArray(input.devices) ? input.devices.map((item) => normalizeText(item, 300)).filter(Boolean) : [],
+        preconditions: Array.isArray(input.preconditions) ? input.preconditions.map((item) => normalizeText(item, 1000)).filter(Boolean) : [],
         steps,
       },
     });
@@ -1689,7 +1692,7 @@ class OrganizationService {
     assertObject(input, "决策事项");
     const title = normalizeText(input.title, 500);
     if (title.length < 4) throw Object.assign(new Error("决策事项需要明确标题"), { statusCode: 400 });
-    const options = Array.isArray(input.options) ? input.options.map((item) => normalizeText(item, 2000)).filter(Boolean).slice(0, 12) : [];
+    const options = Array.isArray(input.options) ? input.options.map((item) => normalizeText(item, 2000)).filter(Boolean) : [];
     const id = makeId("dec");
     this.ledger.append("decision.requested", {
       missionId,
@@ -1791,8 +1794,8 @@ class OrganizationService {
         overriddenGates,
         reason,
         risk,
-        allowedActions: Array.isArray(input.allowedActions) ? input.allowedActions.map((item) => normalizeText(item, 300)).filter(Boolean).slice(0, 20) : [],
-        forbiddenActions: Array.isArray(input.forbiddenActions) ? input.forbiddenActions.map((item) => normalizeText(item, 300)).filter(Boolean).slice(0, 20) : [],
+        allowedActions: Array.isArray(input.allowedActions) ? input.allowedActions.map((item) => normalizeText(item, 300)).filter(Boolean) : [],
+        forbiddenActions: Array.isArray(input.forbiddenActions) ? input.forbiddenActions.map((item) => normalizeText(item, 300)).filter(Boolean) : [],
         expiresAt,
         rollbackTrigger: normalizeText(input.rollbackTrigger, 2000),
         compensation: normalizeText(input.compensation, 2000),
@@ -1968,10 +1971,10 @@ class OrganizationService {
         id: makeId("idea"),
         decisionCaseId: normalizeText(input.decisionCaseId, 200) || null,
         problem: normalizeText(input.problem, 2000),
-        clusters: clusters.slice(0, 12),
-        extremeOptions: Array.isArray(input.extremeOptions) ? input.extremeOptions.map((item) => normalizeText(item, 2000)).filter(Boolean).slice(0, 6) : [],
-        assumptions: Array.isArray(input.assumptions) ? input.assumptions.map((item) => normalizeText(item, 2000)).filter(Boolean).slice(0, 12) : [],
-        unknowns: Array.isArray(input.unknowns) ? input.unknowns.map((item) => normalizeText(item, 2000)).filter(Boolean).slice(0, 12) : [],
+        clusters,
+        extremeOptions: Array.isArray(input.extremeOptions) ? input.extremeOptions.map((item) => normalizeText(item, 2000)).filter(Boolean) : [],
+        assumptions: Array.isArray(input.assumptions) ? input.assumptions.map((item) => normalizeText(item, 2000)).filter(Boolean) : [],
+        unknowns: Array.isArray(input.unknowns) ? input.unknowns.map((item) => normalizeText(item, 2000)).filter(Boolean) : [],
       },
     });
     return this.mission(missionId);
@@ -1990,11 +1993,11 @@ class OrganizationService {
       actorRoleId: normalizeText(input.recordedRoleId, 80) || "deliberator",
       payload: {
         decisionCaseId: decisionCase.id,
-        candidates: candidates.slice(0, 20),
+        candidates,
         tradeoffs: normalizeText(input.tradeoffs, 6000),
         recommendation: normalizeText(input.recommendation, 4000),
         confidence: ["low", "medium", "high"].includes(input.confidence) ? input.confidence : "medium",
-        minorityOpinions: input.minorityOpinions.map((item) => normalizeText(item, 2000)).slice(0, 12),
+        minorityOpinions: input.minorityOpinions.map((item) => normalizeText(item, 2000)),
         reconsiderConditions: normalizeText(input.reconsiderConditions, 2000),
       },
     });
@@ -2415,7 +2418,7 @@ class OrganizationService {
 
   _queueRequirementRun(missionId, runOptions = {}) {
     this._queueRoleRun(missionId, "requirements-lead", buildRequirementPrompt, (mission, parsed, run) => {
-      const questions = Array.isArray(parsed.questions) ? parsed.questions.slice(0, 8) : [];
+      const questions = Array.isArray(parsed.questions) ? parsed.questions : [];
       const message = normalizeText(parsed.message, 6000) || "需求明确岗已完成本轮整理。";
       this.ledger.append("message.recorded", {
         missionId,
@@ -2460,7 +2463,7 @@ class OrganizationService {
         causationId: run.id,
         payload: parsed.charter,
       });
-      parsed.workItems.slice(0, 8).forEach((item, index) => {
+      parsed.workItems.forEach((item, index) => {
         const ownerRoleId = ROLE_BY_ID.has(item.ownerRoleId) ? item.ownerRoleId : "task-owner";
         this.ledger.append("work_item.created", {
           missionId,
@@ -2472,7 +2475,7 @@ class OrganizationService {
             ownerRoleId,
             ownerRoleName: ROLE_BY_ID.get(ownerRoleId).name,
             deliverable: normalizeText(item.deliverable, 1000),
-            acceptance: Array.isArray(item.acceptance) ? item.acceptance.slice(0, 12) : [],
+            acceptance: Array.isArray(item.acceptance) ? item.acceptance : [],
           },
         });
       });
