@@ -162,6 +162,27 @@ function retrievalFocusFor(roleId) {
 
 const CLARIFICATION_BUDGET_MS = 20 * 60_000;
 
+const GATE_REGISTRY = [
+  { id: "G-DEMAND-BASELINE", name: "需求门禁", checks: "存在待确认的需求基线草案", evidence: "baseline.drafted + 版本号", owner: "human-owner", failResult: "工程不可达", overridable: false },
+  { id: "G-ENGINEERING-READY", name: "开工门禁", checks: "基线已确认且任务章程与分工已建立", evidence: "baseline.confirmed + charter.created", owner: "chief-manager", failResult: "工程 Run 不启动", overridable: false },
+  { id: "G-REVIEW", name: "独立复核门禁", checks: "复核结论为 pass 且复核者非执行者", evidence: "review.recorded[verdict=pass]", owner: "independent-reviewer", failResult: "返工或阻塞", overridable: true },
+  { id: "G-TEST", name: "测试门禁", checks: "项目测试集全部必跑项通过", evidence: "test_run.recorded 全绿", owner: "tester", failResult: "GapCase + 全量重跑", overridable: true },
+  { id: "G-RELEASE-CANDIDATE", name: "发布候选门禁", checks: "绑定 VerifiedBaseline 的不可变候选", evidence: "release_candidate.created + verifiedBaselineId", owner: "chief-manager", failResult: "不得进入发布流程", overridable: false },
+  { id: "G-SOURCE", name: "来源核对门禁", checks: "工作树干净、分支明确、领先远端基线", evidence: "source_verified + digest 指纹", owner: "task-owner", failResult: "不得申请合并授权", overridable: true },
+  { id: "G-MERGE", name: "合并授权", checks: "人类明确批准指定候选", evidence: "merge_approval 绑定候选指纹", owner: "human-owner", failResult: "不得合并", overridable: false },
+  { id: "G-DEPLOY", name: "部署授权", checks: "已获合并授权且人类明确批准部署", evidence: "deployment_approval 绑定候选指纹", owner: "human-owner", failResult: "不得部署", overridable: false },
+  { id: "G-EVIDENCE", name: "外部证据门禁", checks: "绑定候选身份的通过证据", evidence: "external_evidence.recorded[passed]", owner: "human-owner", failResult: "候选作废或返工", overridable: true },
+  { id: "G-ACCEPT", name: "结果验收", checks: "人类明确验收业务结果", evidence: "result_acceptance", owner: "human-owner", failResult: "Mission 不关闭", overridable: false },
+  { id: "G-RECOVERY", name: "恢复预算门禁", checks: "开放阻塞 + 剩余恢复次数 + 可恢复角色", evidence: "blocker + attemptBudget", owner: "blocker-lead", failResult: "转人类处理", overridable: true },
+  { id: "G-ASSIGN", name: "任职门禁", checks: "模型与推理强度组合受适配器支持", evidence: "AssignmentSnapshot", owner: "chief-manager", failResult: "拒绝派活", overridable: false },
+  { id: "G-PROJECT", name: "项目门禁", checks: "目标项目存在且未归档", evidence: "project registry", owner: "human-owner", failResult: "拒绝建会话", overridable: false },
+];
+
+function gateError(gateId, message, statusCode = 409) {
+  const gate = GATE_REGISTRY.find((item) => item.id === gateId);
+  return Object.assign(new Error(`[${gateId}${gate ? ` ${gate.name}` : ""}] ${message}`), { statusCode, gateId });
+}
+
 const ISSUE_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"]);
 
 const DEFAULT_SELF_PROJECT = {
@@ -1288,8 +1309,8 @@ class OrganizationService {
     const target = normalizeText(targetProjectId, 200);
     if (target) {
       const registered = this._projectRegistry().find((item) => item.id === target);
-      if (!registered) throw Object.assign(new Error(`未知目标项目：${target}`), { statusCode: 400 });
-      if (registered.status === "archived") throw Object.assign(new Error("目标项目已归档，请重开后再建会话"), { statusCode: 409 });
+      if (!registered) throw gateError("G-PROJECT", `未知目标项目：${target}`, 400);
+      if (registered.status === "archived") throw gateError("G-PROJECT", "目标项目已归档，请重开后再建会话");
     }
     this.ledger.append("mission.created", {
       missionId,
@@ -1602,7 +1623,7 @@ class OrganizationService {
   confirmBaseline(missionId) {
     const mission = this._requireMission(missionId);
     if (mission.status !== "awaiting_baseline_confirmation" || !mission.baseline) {
-      throw Object.assign(new Error("当前没有可确认的需求基线"), { statusCode: 409 });
+      throw gateError("G-DEMAND-BASELINE", "当前没有可确认的需求基线");
     }
     this._assertNoOtherActiveRun(missionId);
     this.ledger.append("baseline.confirmed", {
@@ -1618,7 +1639,7 @@ class OrganizationService {
   retry(missionId) {
     const mission = this._requireMission(missionId);
     if (mission.status !== "blocked") {
-      throw Object.assign(new Error("只有阻塞 Mission 可以重试"), { statusCode: 409 });
+      throw gateError("G-RECOVERY", "只有阻塞 Mission 可以重试");
     }
     this._assertNoOtherActiveRun(missionId);
     const openBlocker = mission.blockers.findLast((item) => item.status === "open");
@@ -1627,7 +1648,7 @@ class OrganizationService {
       (item) => item.status === "closed" && item.resolution === "retry",
     ).length;
     if (attempts >= this.maxRecoveryAttempts) {
-      throw Object.assign(new Error("恢复预算已耗尽，需要人类处理"), { statusCode: 409 });
+      throw gateError("G-RECOVERY", "恢复预算已耗尽，需要人类处理");
     }
     const roleId = openBlocker.failedRoleId || mission.runs.at(-1)?.roleId;
     if (!roleId) throw Object.assign(new Error("BlockerCase 缺少可恢复责任角色"), { statusCode: 409 });
@@ -1675,16 +1696,16 @@ class OrganizationService {
           : {},
     };
     if (path.resolve(snapshot.workingDirectory) !== path.resolve(this._projectFor(mission).workingDirectory || this.project.workingDirectory)) {
-      throw Object.assign(new Error("发布来源工作树与 Mission 目标项目工作树不一致"), { statusCode: 409 });
+      throw gateError("G-SOURCE", "发布来源工作树与 Mission 目标项目工作树不一致");
     }
     if (!snapshot.sourceRefCommit || !snapshot.headCommit || !snapshot.branch) {
-      throw Object.assign(new Error("发布来源缺少分支或提交身份"), { statusCode: 409 });
+      throw gateError("G-SOURCE", "发布来源缺少分支或提交身份");
     }
     if (!snapshot.clean) {
-      throw Object.assign(new Error("发布候选工作树不干净，不能申请发布授权"), { statusCode: 409 });
+      throw gateError("G-SOURCE", "发布候选工作树不干净，不能申请发布授权");
     }
     if (!Number.isInteger(snapshot.ahead) || snapshot.ahead < 1 || snapshot.behind !== 0) {
-      throw Object.assign(new Error("发布候选必须领先且不落后于已核对的远端基线"), { statusCode: 409 });
+      throw gateError("G-SOURCE", "发布候选必须领先且不落后于已核对的远端基线");
     }
     const digest = createHash("sha256")
       .update(
@@ -1709,7 +1730,7 @@ class OrganizationService {
     const mission = this._requireVerifiedCandidate(missionId);
     this._assertNoOtherActiveRun(missionId);
     if (this._candidateApproval(mission, "merge_approval")) {
-      throw Object.assign(new Error("该发布候选已获得合并授权"), { statusCode: 409 });
+      throw gateError("G-MERGE", "该发布候选已获得合并授权");
     }
     this._recordCandidateApproval(mission, "merge_approval", "人类明确批准合并该候选");
     this._setStatus(missionId, "awaiting_release_approval", "合并授权已记录，等待人类批准部署候选");
@@ -1720,10 +1741,10 @@ class OrganizationService {
     const mission = this._requireVerifiedCandidate(missionId);
     this._assertNoOtherActiveRun(missionId);
     if (!this._candidateApproval(mission, "merge_approval")) {
-      throw Object.assign(new Error("必须先单独批准合并"), { statusCode: 409 });
+      throw gateError("G-DEPLOY", "必须先单独批准合并");
     }
     if (this._candidateApproval(mission, "deployment_approval")) {
-      throw Object.assign(new Error("该发布候选已获得部署授权"), { statusCode: 409 });
+      throw gateError("G-DEPLOY", "该发布候选已获得部署授权");
     }
     this._recordCandidateApproval(
       mission,
@@ -1818,7 +1839,7 @@ class OrganizationService {
   recordExternalEvidence(missionId, input) {    const mission = this._requireMission(missionId);
     this._assertNoOtherActiveRun(missionId);
     if (mission.status !== "awaiting_external_evidence" || !mission.releaseCandidate?.digest) {
-      throw Object.assign(new Error("当前不接受外部验收证据"), { statusCode: 409 });
+      throw gateError("G-EVIDENCE", "当前不接受外部验收证据");
     }
     assertObject(input, "外部验收证据");
     const buildIdentity = normalizeText(input.buildIdentity, 500);
@@ -1858,12 +1879,12 @@ class OrganizationService {
     const mission = this._requireMission(missionId);
     this._assertNoOtherActiveRun(missionId);
     if (mission.status !== "awaiting_result_acceptance" || !mission.releaseCandidate?.digest) {
-      throw Object.assign(new Error("当前没有可验收的业务结果"), { statusCode: 409 });
+      throw gateError("G-ACCEPT", "当前没有可验收的业务结果");
     }
     const evidence = mission.externalEvidence.findLast(
       (item) => item.candidateId === mission.releaseCandidate.id && item.result === "passed",
     );
-    if (!evidence) throw Object.assign(new Error("缺少绑定当前候选的通过外部验收证据"), { statusCode: 409 });
+    if (!evidence) throw gateError("G-ACCEPT", "缺少绑定当前候选的通过外部验收证据");
     this._recordCandidateApproval(mission, "result_acceptance", "人类明确验收业务结果");
     this._setStatus(missionId, "accepted", "人类已验收业务结果，Mission 完成");
     return this.mission(missionId);
@@ -2410,7 +2431,7 @@ class OrganizationService {
   _requireVerifiedCandidate(missionId) {
     const mission = this._requireMission(missionId);
     if (mission.status !== "awaiting_release_approval" || !mission.releaseCandidate?.digest) {
-      throw Object.assign(new Error("发布候选尚未完成来源核对"), { statusCode: 409 });
+      throw gateError("G-SOURCE", "发布候选尚未完成来源核对");
     }
     return mission;
   }
@@ -2785,7 +2806,7 @@ class OrganizationService {
         });
         return;
       }
-      if (parsed.verdict !== "pass") throw new Error("复核输出 verdict 无效");
+      if (parsed.verdict !== "pass") throw new Error("[G-REVIEW 独立复核门禁] 复核输出 verdict 无效");
       if (mission.workflowProfile?.resolved === "light") {
         const delivery = mission.evidence.at(-1) || null;
         this.ledger.append("change_record.recorded", {
@@ -2822,7 +2843,7 @@ class OrganizationService {
       const missingIds = requiredIds.filter((id) => !testRuns.some((testRun) => testRun.testId === id));
       const failedRequiredIds = requiredIds.filter((id) => testRuns.find((testRun) => testRun.testId === id)?.result !== "passed");
       if (parsed.verdict === "pass" && (missingIds.length || failedRequiredIds.length)) {
-        throw new Error(`ProjectTestManifest 必跑项未全部通过：${[...new Set([...missingIds, ...failedRequiredIds])].join(", ")}`);
+        throw new Error(`[G-TEST 测试门禁] ProjectTestManifest 必跑项未全部通过：${[...new Set([...missingIds, ...failedRequiredIds])].join(", ")}`);
       }
       const testRunEvent = this.ledger.append("test_run.recorded", {
         missionId,
@@ -2880,10 +2901,10 @@ class OrganizationService {
         });
         return;
       }
-      if (parsed.verdict !== "pass") throw new Error("测试输出 verdict 无效");
+      if (parsed.verdict !== "pass") throw new Error("[G-TEST 测试门禁] 测试输出 verdict 无效");
       const candidateIdentity = normalizeText(parsed.candidate?.commit, 500);
       if (candidateIdentity.length < 7 || parsed.candidate?.clean !== true) {
-        throw new Error("重度验证必须绑定精确且干净的候选身份");
+        throw new Error("[G-TEST 测试门禁] 重度验证必须绑定精确且干净的候选身份");
       }
       mission.gapCases.filter((item) => item.status === "open").forEach((gapCase) => {
         this.ledger.append("gap_case.closed", {
@@ -3283,6 +3304,7 @@ module.exports = {
   JsonlLedger,
   OrganizationService,
   ROLE_DEFINITIONS,
+  GATE_REGISTRY,
   SYSTEM_VERSION,
   PROJECT_ID,
   MANAGER_MODEL,

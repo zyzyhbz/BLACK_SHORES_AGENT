@@ -57,6 +57,7 @@ let emailState = null;
 let governanceState = null;
 let ledgerEvents = [];
 let inspectionState = null;
+let gateRegistry = [];
 let loading = true;
 let requestInFlight = false;
 let tunerInFlight = false;
@@ -1068,6 +1069,7 @@ function renderQuality() {
           <button type="button" class="button button-secondary" data-action="new-override">${icon("siren")}紧急绕过</button>
         </div>
       </header>
+      ${(gateRegistry || []).length ? `<div class="work-item-list"><div class="assignment-list-title"><strong>门禁注册表（违反时会报编号）</strong><span>先看编号，再看缺什么证据</span></div>${gateRegistry.map((gate) => `<div class="work-item"><span class="work-state ${gate.overridable ? "" : "work-completed"}"></span><div><strong>${escapeHtml(gate.id)} ${escapeHtml(gate.name)}</strong><small>检查：${escapeHtml(gate.checks)} · 证据：${escapeHtml(gate.evidence)} · 把关：${escapeHtml(gate.owner)} · 失败：${escapeHtml(gate.failResult)}${gate.overridable ? " · 可绕过（留风险债务）" : " · 不可绕过"}</small></div><span></span></div>`).join("")}</div>` : ""}
       <div class="workbench-grid">
         <section class="conversation-column">
           ${simpleList("开放 GapCase", gapCases, ({ mission, gap }) => ({ title: gap.id, subtitle: `${mission.title} · ${gap.status} · ${gap.at || ""}` }))}
@@ -2167,7 +2169,7 @@ async function refreshState({ quiet = false } = {}) {
   if (!quiet) loading = true;
   if (!quiet) renderCurrentView();
   try {
-    const [state, health, ledger, configuration, email, governance, inspections] = await Promise.all([
+    const [state, health, ledger, configuration, email, governance, inspections, gates] = await Promise.all([
       api("/api/organization/state"),
       api("/api/health"),
       api("/api/organization/events"),
@@ -2175,11 +2177,13 @@ async function refreshState({ quiet = false } = {}) {
       api("/api/channels/email"),
       api("/api/governance/status"),
       api("/api/organization/inspections"),
+      api("/api/governance/gates"),
     ]);
     organizationState = state;
     healthState = health;
     ledgerEvents = ledger.events || [];
     inspectionState = inspections;
+    gateRegistry = gates.gates || [];
     configurationState = configuration;
     emailState = email;
     governanceState = governance;

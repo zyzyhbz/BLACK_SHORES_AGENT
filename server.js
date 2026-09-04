@@ -7,6 +7,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const {
   JsonlLedger,
   OrganizationService,
+  GATE_REGISTRY,
 } = require("./organization-core");
 const { loadConfig } = require("./config");
 const { RuntimeGovernance } = require("./runtime-governance");
@@ -1681,6 +1682,11 @@ const server = http.createServer(async (request, response) => {
       configured: appConfig.configured,
       activeRunIds: organization.state().activeRunIds,
     });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/governance/gates") {
+    sendJson(response, 200, { gates: GATE_REGISTRY });
     return;
   }
 

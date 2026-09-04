@@ -1432,6 +1432,45 @@ test("projects are created from a workspace and archived only when quiet", async
   assert.equal(reopened.status, "active");
 });
 
+test("gate registry names every rejection with evidence and owner", async () => {
+  const { GATE_REGISTRY } = require("./organization-core");
+  assert.equal(GATE_REGISTRY.length, 13);
+  for (const gate of GATE_REGISTRY) {
+    assert.ok(/^G-[A-Z-]+$/.test(gate.id));
+    for (const field of ["name", "checks", "evidence", "owner", "failResult"]) {
+      assert.ok(gate[field] && gate[field].length > 0, `${gate.id} 缺少 ${field}`);
+    }
+    assert.equal(typeof gate.overridable, "boolean");
+  }
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  const mission = service.createMission("验证门禁编号随错误返回");
+  await settle(service);
+  assert.throws(() => service.confirmBaseline(mission.id), /\[G-DEMAND-BASELINE 需求门禁\]/);
+  const overridden = service.grantOverride(mission.id, {
+    decidedBy: "human-owner",
+    overriddenGates: ["G-TEST 测试门禁"],
+    reason: "线上事故止血确认",
+    risk: "可能漏过回归缺陷",
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  });
+  assert.equal(overridden.overrides.length, 1);
+  const retryError = (() => {
+    try {
+      service.retry(mission.id);
+    } catch (error) {
+      return error;
+    }
+    return null;
+  })();
+  assert.match(retryError.message, /\[G-RECOVERY 恢复预算门禁\]/);
+  assert.equal(retryError.gateId, "G-RECOVERY");
+});
+
 test("usage never overwrites the current action and details reach checkpoints", async () => {
   const { directory, ledger } = tempLedger();
   let captured = null;
