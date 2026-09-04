@@ -1361,8 +1361,7 @@ test("missions bind an explicit target project that routes execution", async () 
   probing.requestSafePause(mission.id);
 });
 
-test("clarification beyond 20 minutes escalates to a human decision", async () => {
-  const { directory } = tempLedger();
+test("clarification beyond 20 minutes escalates to a human decision", async () => {  const { directory } = tempLedger();
   const ledgerPath = path.join(directory, "ledger.jsonl");
   const past = new Date(Date.now() - 21 * 60_000).toISOString();
   const lines = [
@@ -1384,4 +1383,30 @@ test("clarification beyond 20 minutes escalates to a human decision", async () =
   await settle(service);
   service._escalateStalemate(fresh.id);
   assert.equal(service.mission(fresh.id).decisions.filter((item) => item.kind === "requirements_stalemate").length, 0);
+});
+
+test("projects are created from a workspace and archived only when quiet", async () => {
+  const { directory, ledger } = tempLedger();
+  const workspace = path.join(directory, "demo-proj");
+  fs.mkdirSync(workspace);
+  fs.writeFileSync(path.join(workspace, "package.json"), JSON.stringify({ name: "demo", scripts: { test: "node --test" } }), "utf8");
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({ output: JSON.stringify({ readyForBaseline: false, message: "等待", questions: [] }) }),
+  });
+  assert.throws(() => service.publishProject({ name: "坏目录", workingDirectory: path.join(directory, "missing") }), /不是目录/);
+  const created = service.publishProject({ name: "", workingDirectory: workspace });
+  assert.equal(created.name, "demo");
+  assert.match(created.testCommand, /node --test/);
+  assert.ok(service.state().projects.some((item) => item.id === created.id && item.status === "active"));
+  const mission = service.createMission("验证归档拦截活跃会话", "auto", created.id);
+  await settle(service);
+  assert.throws(() => service.archiveProject(created.id, {}), /未终结会话/);
+  service.cancelMission(mission.id, { reason: "测试清理" });
+  const archived = service.archiveProject(created.id, { reason: "测试归档" });
+  assert.equal(archived.status, "archived");
+  assert.throws(() => service.createMission("验证归档项目不可用", "auto", created.id), /已归档/);
+  const reopened = service.reopenProject(created.id);
+  assert.equal(reopened.status, "active");
 });

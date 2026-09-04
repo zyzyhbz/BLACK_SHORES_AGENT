@@ -653,7 +653,10 @@ function renderMissions() {
     <section class="page-section">
       <header class="section-heading">
         <div><span class="section-kicker">业务结果容器</span><h2>Mission</h2></div>
-        <button type="button" class="button button-primary" data-action="new-mission" ${organizationState?.controls?.canCreateMission === false ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
+        <div class="section-actions">
+          <button type="button" class="button button-secondary" data-action="manage-projects">${icon("folder-cog")}项目管理</button>
+          <button type="button" class="button button-primary" data-action="new-mission" ${organizationState?.controls?.canCreateMission === false ? "disabled" : ""}>${icon("plus")}新建 Mission</button>
+        </div>
       </header>
       <div class="mission-table">
         <div class="table-head"><span>Mission</span><span>状态</span><span>责任阶段</span><span>更新时间</span><span></span></div>
@@ -1872,8 +1875,70 @@ function openSkillDialog() {
   });
 }
 
-function openManifestDialog() {
-  openFormDialog("质量与发布", "发布项目测试集", "manifestForm", `
+function openProjectDialog() {
+  const projects = organizationState?.projects || [];
+  detailContent.innerHTML = `
+    <header class="dialog-header"><div><span class="section-kicker">项目由人类管理</span><h2>项目管理</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭" title="关闭">${icon("x")}</button></header>
+    <div class="work-item-list">${projects.map((project) => `<div class="work-item"><span><strong>${escapeHtml(project.name || project.id)}</strong><small>${escapeHtml(project.workingDirectory || "")}</small></span><span><small>${escapeHtml(project.status || "active")}</small> ${project.status === "archived"
+      ? `<button type="button" class="button button-secondary" data-project-action="reopen" data-project-id="${escapeHtml(project.id)}">重开</button>`
+      : `<button type="button" class="button button-secondary" data-project-action="archive" data-project-id="${escapeHtml(project.id)}">归档</button>`}</span></div>`).join("") || '<div class="quiet-empty">暂无</div>'}</div>
+    <form class="agent-config-form" id="projectCreateForm">
+      <div class="form-grid">
+        <label class="field-label"><span>名称（可选，会自动发现）</span><input type="text" name="name" /></label>
+        <label class="field-label form-span"><span>初始工作空间（本地目录，必填）</span><input type="text" name="workingDirectory" placeholder="如 E:\\MyProject" required /></label>
+      </div>
+      <footer class="dialog-actions"><button type="button" class="button button-secondary" data-close-dialog>关闭</button><button type="submit" class="button button-primary">${icon("plus")}新增项目</button></footer>
+    </form>`;
+  detailDialog.showModal();
+  detailContent.querySelectorAll("[data-close-dialog]").forEach((button) => {
+    button.addEventListener("click", () => detailDialog.close());
+  });
+  detailContent.querySelectorAll("[data-project-action]").forEach((button) => {
+    button.addEventListener("click", () => projectAction(button.dataset.projectAction, button.dataset.projectId));
+  });
+  document.getElementById("projectCreateForm")?.addEventListener("submit", submitProjectCreate);
+  refreshIcons();
+}
+
+async function submitProjectCreate(event) {
+  event.preventDefault();
+  if (requestInFlight) return;
+  const form = new FormData(event.currentTarget);
+  requestInFlight = true;
+  try {
+    await api("/api/projects", {
+      method: "POST",
+      body: JSON.stringify({ name: form.get("name"), workingDirectory: form.get("workingDirectory") }),
+    });
+    showToast("项目已新增，仓库与验证命令已自动发现");
+    await refreshState({ quiet: true });
+    openProjectDialog();
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+async function projectAction(action, projectId) {
+  if (requestInFlight) return;
+  if (action === "archive" && !window.confirm("归档后新会话不能再选它，旧账本照常可查，继续吗？")) return;
+  requestInFlight = true;
+  try {
+    await api(`/api/projects/${encodeURIComponent(projectId)}/${action}`, { method: "POST", body: JSON.stringify({}) });
+    showToast(action === "archive" ? "项目已归档" : "项目已重开");
+    await refreshState({ quiet: true });
+    openProjectDialog();
+  } catch (error) {
+    showToast(error.message, "danger");
+  } finally {
+    requestInFlight = false;
+    renderCurrentView();
+  }
+}
+
+function openManifestDialog() {  openFormDialog("质量与发布", "发布项目测试集", "manifestForm", `
     <label class="field-label"><span>项目 ID</span><input type="text" name="projectId" value="${escapeHtml(organizationState?.project?.id || "")}" required /></label>
     <label class="field-label"><span>版本</span><input type="text" name="version" placeholder="2026.09-mvp.2" required /></label>
     <label class="field-label form-span"><span>必跑项 JSON 数组（id/name/command/environment）</span><textarea name="requiredTests" rows="4" spellcheck="false">[{"id":"t1","name":"冒烟","command":"run","environment":"冻结候选"}]</textarea></label>`, "发布测试集版本");
@@ -2288,6 +2353,7 @@ function bindDynamicEvents() {
       else if (action === "new-override") openOverrideDialog(button.dataset.missionId);
       else if (action === "new-waiting") openWaitingDialog(button.dataset.missionId);
       else if (action === "new-manifest") openManifestDialog();
+      else if (action === "manage-projects") openProjectDialog();
       else if (action === "new-case") openCaseDialog();
       else if (action === "new-idea") openIdeaDialog(button.dataset.missionId, button.dataset.caseId);
       else if (action === "new-brief") openBriefDialog(button.dataset.missionId, button.dataset.caseId);
