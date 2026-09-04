@@ -160,7 +160,7 @@ class RuntimeGovernance {
     const workingDirectory = path.resolve(recorded.payload?.workingDirectory || this._traceWorkingDirectory(recorded) || this.project.workingDirectory);
     const explicit = Array.isArray(input.paths) ? input.paths.map((item) => String(item || "").trim()).filter(Boolean) : [];
     const detected = this._traceChangedPaths(recorded);
-    const targets = [...new Set([...explicit, ...detected])].slice(0, 200);
+    const targets = [...new Set([...explicit, ...detected])];
     if (!targets.length) throw Object.assign(new Error("无法确定变更范围，请明确列出要恢复的文件"), { statusCode: 400 });
     const extractDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "black-shores-revert-"));
     this._expandArchive(archive, extractDirectory);
