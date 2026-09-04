@@ -16,6 +16,7 @@ const DEFAULT_CONFIG = {
   inactiveProjects: [
     { id: "project-fixture-inactive", name: "Inactive Fixture", status: "inactive" },
   ],
+  projects: {},
   manager: {
     adapter: "auto",
     model: "",

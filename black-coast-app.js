@@ -211,6 +211,7 @@ function renderEmptyWorkbench() {
           required
         >${escapeHtml(commandDrafts.get("new") || "")}</textarea>
         <div class="composer-footer">
+          <label class="field-label"><span>目标项目</span><select name="project">${(organizationState?.projects || []).map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name || project.id)}</option>`).join("")}</select></label>
           <span>${icon("shield-check")} 创建后先进入需求门禁</span>
           <button type="submit" class="button button-primary" ${requestInFlight ? "disabled" : ""}>
             ${icon(requestInFlight ? "loader-circle" : "arrow-up", requestInFlight ? "spin" : "")}
@@ -566,16 +567,27 @@ function renderActiveRun(mission) {
   const active = organizationState?.activeRuns?.find((run) => run.missionId === mission.id);
   if (!active) return "";
   const runRecord = (mission.runs || []).find((run) => run.id === active.runId);
+  const elapsedMin = active.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(active.startedAt)) / 60000)) : null;
+  const scope = (active.scope || []).filter(Boolean);
   return `
     <section class="inspector-section activity-section">
       <header><span>活动 Run</span><span class="live-indicator"><i></i>${active.pauseRequested ? "暂停中" : "运行中"}</span></header>
-      <div class="activity-line"><span>当前动作</span><strong>${escapeHtml(active.currentAction || "正在建立执行上下文")}</strong></div>
       <div class="activity-line"><span>角色</span><strong>${escapeHtml(active.roleName || "")}</strong></div>
-      <div class="activity-line"><span>实际模型</span><code>${escapeHtml(runRecord?.model || "—")}${runRecord?.reasoningEffort ? ` · ${escapeHtml(runRecord.reasoningEffort)}` : ""}</code></div>
+      <div class="activity-line"><span>实际模型</span><code>${escapeHtml(runRecord?.model || active.model || "—")}${escapeHtml(runRecord?.reasoningEffort || active.reasoningEffort ? ` · ${escapeHtml(runRecord?.reasoningEffort || active.reasoningEffort)}` : "")}</code></div>
+      ${scope.length ? `<div class="activity-line"><span>在做事项</span><strong>${escapeHtml(scope.slice(0, 3).join("；"))}${scope.length > 3 ? `（等共 ${scope.length} 项）` : ""}</strong></div>` : ""}
+      <div class="activity-line"><span>当前动作</span><strong>${escapeHtml(active.currentAction || "正在建立执行上下文")}</strong></div>
       <div class="activity-line"><span>物理调用</span><code>${escapeHtml(active.invocationId || "—")}</code></div>
+      ${elapsedMin !== null ? `<div class="activity-line"><span>已耗时</span><strong>${elapsedMin} 分钟</strong></div>` : ""}
       <div class="activity-line"><span>最后心跳</span><time>${formatTime(active.lastHeartbeatAt)}</time></div>
       <div class="activity-line"><span>最后检查点</span><time>${formatTime(active.lastCheckpointAt)}</time></div>
+      ${active.lastCheckpoint?.summary ? `<div class="activity-line"><span>检查点摘要</span><strong>${escapeHtml(active.lastCheckpoint.summary)}</strong></div>` : ""}
     </section>`;
+}
+
+function targetProjectName(mission) {
+  const projects = organizationState?.projects || [];
+  const found = projects.find((project) => project.id === (mission?.targetProjectId || mission?.projectId));
+  return found?.name || mission?.targetProjectId || mission?.projectId || "";
 }
 
 function renderMissionWorkbench(mission) {
@@ -589,7 +601,7 @@ function renderMissionWorkbench(mission) {
             <span class="section-kicker">${escapeHtml(mission.id)}</span>
             <h2>${escapeHtml(mission.title)}</h2>
           </div>
-          <div class="mission-header-state"><span class="workflow-profile">${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</span>${statusPill(mission.status)}</div>
+          <div class="mission-header-state"><span class="workflow-profile">${escapeHtml(mission.workflowProfile?.requested || "auto")} → ${escapeHtml(mission.workflowProfile?.resolved || "heavy")}</span><span class="workflow-profile">目标项目 ${escapeHtml(targetProjectName(mission))}</span>${statusPill(mission.status)}</div>
         </header>
         <div class="mission-progress" aria-label="工作合同完成项">${progress ? `<span>已完成工作项 ${progress.done}/${progress.total}</span>` : `<span>工作合同尚未建立，暂无可计数项</span>`}</div>
         ${renderMissionControls(mission)}
@@ -650,7 +662,7 @@ function renderMissions() {
               .map(
                 (mission) => `
                   <button type="button" class="mission-row" data-mission-id="${escapeHtml(mission.id)}">
-                    <span><strong>${escapeHtml(mission.title)}</strong><small>${escapeHtml(mission.id)}</small></span>
+                    <span><strong>${escapeHtml(mission.title)}</strong><small>${escapeHtml(mission.id)} · ${escapeHtml(targetProjectName(mission))}</small></span>
                     ${statusPill(mission.status)}
                     <span>${escapeHtml(mission.runs?.at(-1)?.roleName || "群星的调律者")}</span>
                     <time>${formatTime(mission.updatedAt)}</time>
@@ -2060,7 +2072,8 @@ async function submitCommand(event) {
   event.preventDefault();
   if (requestInFlight) return;
   const mission = activeMission();
-  const content = new FormData(event.currentTarget).get("content");
+  const form = new FormData(event.currentTarget);
+  const content = form.get("content");
   const key = commandKey(mission);
   commandDrafts.set(key, content);
   event.currentTarget.querySelector("textarea")?.blur();
@@ -2069,7 +2082,7 @@ async function submitCommand(event) {
   try {
     const payload = await api("/api/organization/commands", {
       method: "POST",
-      body: JSON.stringify({ content, missionId: mission?.id || null }),
+      body: JSON.stringify({ content, missionId: mission?.id || null, targetProjectId: (!mission?.id && form.get("project")) || null }),
     });
     if (payload.mission?.id) selectedMissionId = payload.mission.id;
     commandDrafts.delete(key);

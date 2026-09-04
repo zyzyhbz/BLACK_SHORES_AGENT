@@ -1533,6 +1533,7 @@ const runtimeGovernance = new RuntimeGovernance({
 const organization = new OrganizationService({
   ledger: organizationLedger,
   project: organizationProject,
+  projects: appConfig.projects || {},
   managerAssignment,
   roleAssignments,
   runRole: async ({
@@ -1836,7 +1837,7 @@ const server = http.createServer(async (request, response) => {
   if (request.method === "POST" && url.pathname === "/api/organization/missions") {
     try {
       const payload = await readJsonBody(request);
-      sendJson(response, 202, { mission: organization.createMission(payload.goal, payload.workflowProfile) });
+      sendJson(response, 202, { mission: organization.createMission(payload.goal, payload.workflowProfile, payload.targetProjectId || null) });
     } catch (error) {
       organizationError(response, error);
     }
@@ -1851,6 +1852,7 @@ const server = http.createServer(async (request, response) => {
         missionId: payload.missionId || null,
         channel: payload.channel || "tuner-chat",
         context: payload.context || "automatic",
+        targetProjectId: payload.targetProjectId || null,
       }));
     } catch (error) {
       organizationError(response, error);
