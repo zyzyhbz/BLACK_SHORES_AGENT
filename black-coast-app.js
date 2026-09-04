@@ -62,6 +62,8 @@ let emailRequestInFlight = false;
 let toastTimer = null;
 let pollTimer = null;
 let assignmentDraft = null;
+let imeComposing = false;
+let refreshDeferred = false;
 const commandDrafts = new Map();
 const commandSelections = new Map();
 
@@ -2338,6 +2340,22 @@ function bindDynamicEvents() {
     commandDrafts.set(commandKey(), event.currentTarget.value);
     captureEditorFocus();
   });
+  responseEditor?.addEventListener("compositionstart", () => {
+    imeComposing = true;
+  });
+  responseEditor?.addEventListener("compositionend", () => {
+    imeComposing = false;
+    if (refreshDeferred) {
+      refreshDeferred = false;
+      refreshState({ quiet: true });
+    }
+  });
+  responseEditor?.addEventListener("blur", () => {
+    if (refreshDeferred && !imeComposing) {
+      refreshDeferred = false;
+      refreshState({ quiet: true });
+    }
+  });
   responseEditor?.addEventListener("select", captureEditorFocus);
   responseEditor?.addEventListener("keyup", captureEditorFocus);
   document.getElementById("externalEvidenceForm")?.addEventListener("submit", submitExternalEvidence);
@@ -2446,6 +2464,12 @@ pollTimer = setInterval(() => {
   const hasActiveRun = Boolean(organizationState?.activeRunIds?.length);
   const emailEnabled = emailState?.enabled === true;
   if ((hasActiveRun || emailEnabled) && !requestInFlight && !tunerInFlight && !emailRequestInFlight) {
+    const typing = imeComposing
+      || (document.activeElement instanceof HTMLTextAreaElement && document.activeElement.id === "commandInput");
+    if (typing) {
+      refreshDeferred = true;
+      return;
+    }
     refreshState({ quiet: true });
   }
 }, 3500);
