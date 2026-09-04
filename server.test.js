@@ -597,3 +597,30 @@ test("project registry creates from workspace and archives over HTTP", async (co
   assert.equal(archiveResponse.status, 200);
   assert.equal((await archiveResponse.json()).project.status, "archived");
 });
+
+test("organization stream pushes ledger changes over SSE", async (context) => {
+  const directory = tempDirectory();
+  const server = await startServer({ ledgerPath: path.join(directory, "ledger.jsonl"), worktree: directory });
+  context.after(() => stopServer(server.child));
+  const http = require("node:http");
+  const first = await new Promise((resolve, reject) => {
+    const request = http.get(`${server.origin}/api/organization/stream`, (response) => {
+      assert.equal(response.statusCode, 200);
+      assert.match(response.headers["content-type"] || "", /text\/event-stream/);
+      let buffer = "";
+      response.on("data", (chunk) => {
+        buffer += chunk.toString();
+        if (buffer.includes("\n\n")) {
+          response.destroy();
+          resolve(buffer);
+        }
+      });
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    setTimeout(() => reject(new Error("SSE 首帧超时")), 8000).unref?.();
+  });
+  const payload = JSON.parse(first.replace(/^data:\s*/, "").trim());
+  assert.ok(Number.isInteger(payload.eventCount));
+  assert.ok(Number.isInteger(payload.activeRuns));
+});
