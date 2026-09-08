@@ -903,7 +903,8 @@ class OrganizationService {
       ),
       project: this.project,
       projects: this._projectRegistry(),
-      issues: this._issueRegistry(),      projectTestManifest: this.projectTestManifest,
+      issues: this._issueRegistry(),
+      dialogues: this._dialogueRegistry(),      projectTestManifest: this.projectTestManifest,
       projectTestManifests: this.ledger.events()
         .filter((event) => event.type === "test_manifest.published")
         .map((event) => ({
@@ -1070,8 +1071,7 @@ class OrganizationService {
     return [...Object.values(this.projects).map((item) => ({ status: "active", builtin: true, ...item })), ...registered.values()];
   }
 
-  _issueRegistry() {
-    const issues = new Map();
+  _issueRegistry() {    const issues = new Map();
     for (const event of this.ledger.events()) {
       if (event.type === "issue.opened") {
         issues.set(event.payload.id, { openedAt: event.at, history: [], ...event.payload });
@@ -1083,6 +1083,182 @@ class OrganizationService {
       }
     }
     return [...issues.values()].sort((left, right) => String(right.openedAt).localeCompare(String(left.openedAt)));
+  }
+
+  _dialogueRegistry() {
+    const dialogues = new Map();
+    for (const event of this.ledger.events()) {
+      if (event.type === "dialogue.opened") {
+        dialogues.set(event.payload.id, {
+          openedAt: event.at,
+          updatedAt: event.at,
+          messages: [],
+          mentions: [],
+          missionIds: [],
+          ...event.payload,
+        });
+      } else if (event.type === "dialogue.message_recorded") {
+        const dialogue = dialogues.get(event.payload.id);
+        if (dialogue) {
+          dialogue.messages.push({ id: event.payload.messageId, at: event.at, ...event.payload.message });
+          dialogue.updatedAt = event.at;
+        }
+      } else if (event.type === "dialogue.mention_added") {
+        const dialogue = dialogues.get(event.payload.id);
+        if (dialogue) {
+          dialogue.mentions.push({ at: event.at, ...event.payload.mention });
+          dialogue.updatedAt = event.at;
+        }
+      } else if (event.type === "dialogue.mention_refreshed") {
+        const dialogue = dialogues.get(event.payload.id);
+        const mention = dialogue?.mentions.find((item) => item.dialogueId === event.payload.mention.dialogueId);
+        if (mention) {
+          Object.assign(mention, event.payload.mention, { refreshedAt: event.at });
+          dialogue.updatedAt = event.at;
+        }
+      } else if (event.type === "dialogue.mission_linked") {
+        const dialogue = dialogues.get(event.payload.id);
+        if (dialogue && !dialogue.missionIds.includes(event.payload.missionId)) {
+          dialogue.missionIds.push(event.payload.missionId);
+          dialogue.updatedAt = event.at;
+        }
+      }
+    }
+    return [...dialogues.values()].sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  }
+
+  _dialogueAncestors(dialogueId) {
+    const seen = new Set();
+    let current = this._dialogueRegistry().find((item) => item.id === dialogueId)?.parentId;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      current = this._dialogueRegistry().find((item) => item.id === current)?.parentId;
+    }
+    return seen;
+  }
+
+  openDialogue(input) {
+    assertObject(input, "对话");
+    const title = normalizeText(input.title, 300) || "未命名对话";
+    const projectId = normalizeText(input.projectId, 200) || this.project.id;
+    const registered = this._projectRegistry().find((item) => item.id === projectId);
+    if (!registered) throw Object.assign(new Error(`未知目标项目：${projectId}`), { statusCode: 400 });
+    if (registered.status === "archived") throw Object.assign(new Error("目标项目已归档"), { statusCode: 409 });
+    const parentId = normalizeText(input.parentId, 200);
+    let forkSnapshot = null;
+    if (parentId) {
+      const parent = this._dialogueRegistry().find((item) => item.id === parentId);
+      if (!parent) throw Object.assign(new Error("源对话不存在"), { statusCode: 404 });
+      forkSnapshot = {
+        messages: parent.messages.map((message) => ({ ...message })),
+        mentions: parent.mentions.map((mention) => ({ ...mention })),
+        sourceUpdatedAt: parent.updatedAt,
+      };
+    }
+    const id = makeId("dlg");
+    this.ledger.append("dialogue.opened", {
+      actorRoleId: "human-owner",
+      payload: { id, projectId, title, parentId: parentId || null, forkSnapshot },
+    });
+    if (forkSnapshot) {
+      for (const message of forkSnapshot.messages) {
+        this.ledger.append("dialogue.message_recorded", {
+          actorRoleId: "human-owner",
+          payload: {
+            id,
+            messageId: makeId("dmsg"),
+            message: { ...message, forkedFrom: parentId },
+          },
+        });
+      }
+      for (const mention of forkSnapshot.mentions) {
+        this.ledger.append("dialogue.mention_added", {
+          actorRoleId: "human-owner",
+          payload: { id, mention: { ...mention, forkedFrom: parentId } },
+        });
+      }
+    }
+    return this._dialogueRegistry().find((item) => item.id === id);
+  }
+
+  recordDialogueMessage(dialogueId, input) {
+    assertObject(input, "对话消息");
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
+    const content = normalizeText(input.content, 12000);
+    if (!content) throw Object.assign(new Error("消息不能为空"), { statusCode: 400 });
+    const authorType = input.authorType === "role" ? "role" : "human";
+    const messageId = makeId("dmsg");
+    this.ledger.append("dialogue.message_recorded", {
+      actorRoleId: "human-owner",
+      payload: { id: dialogueId, messageId, message: { authorType, roleId: normalizeText(input.roleId, 80), content } },
+    });
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
+  }
+
+  addMention(dialogueId, input) {
+    assertObject(input, "引用");
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
+    const sourceId = normalizeText(input.sourceId, 200);
+    if (!sourceId) throw Object.assign(new Error("必须指定源对话"), { statusCode: 400 });
+    if (sourceId === dialogueId) throw Object.assign(new Error("不能引用自身"), { statusCode: 400 });
+    const source = this._dialogueRegistry().find((item) => item.id === sourceId);
+    if (!source) throw Object.assign(new Error("源对话不存在"), { statusCode: 404 });
+    if (this._dialogueAncestors(sourceId).has(dialogueId)) {
+      throw Object.assign(new Error("引用将形成循环，已拒绝"), { statusCode: 409 });
+    }
+    if (source.mentions.some((item) => item.dialogueId === dialogueId)) {
+      throw Object.assign(new Error("引用将形成循环，已拒绝"), { statusCode: 409 });
+    }
+    this.ledger.append("dialogue.mention_added", {
+      actorRoleId: "human-owner",
+      payload: {
+        id: dialogueId,
+        mention: {
+          dialogueId: sourceId,
+          projectId: source.projectId,
+          title: source.title,
+          messages: source.messages.map((message) => ({ ...message })),
+          sourceUpdatedAt: source.updatedAt,
+        },
+      },
+    });
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
+  }
+
+  refreshMention(dialogueId, sourceId) {
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    const mention = dialogue?.mentions.find((item) => item.dialogueId === sourceId);
+    if (!mention) throw Object.assign(new Error("该引用不存在"), { statusCode: 404 });
+    const source = this._dialogueRegistry().find((item) => item.id === sourceId);
+    if (!source) throw Object.assign(new Error("源对话不存在"), { statusCode: 404 });
+    this.ledger.append("dialogue.mention_refreshed", {
+      actorRoleId: "human-owner",
+      payload: {
+        id: dialogueId,
+        mention: {
+          dialogueId: sourceId,
+          projectId: source.projectId,
+          title: source.title,
+          messages: source.messages.map((message) => ({ ...message })),
+          sourceUpdatedAt: source.updatedAt,
+        },
+      },
+    });
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
+  }
+
+  linkDialogueMission(dialogueId, missionId) {
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
+    const mission = this.mission(missionId);
+    if (!mission) throw Object.assign(new Error("Mission 不存在"), { statusCode: 404 });
+    this.ledger.append("dialogue.mission_linked", {
+      actorRoleId: "human-owner",
+      payload: { id: dialogueId, missionId },
+    });
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
   }
 
   openIssue(input) {
