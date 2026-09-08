@@ -1965,7 +1965,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
-  const dialogueMessageMatch = url.pathname.match(/^\/api\/dialogues\/([^/]+)\/(messages|mentions|fork|mission)$/);
+  const dialogueMessageMatch = url.pathname.match(/^\/api\/dialogues\/([^/]+)\/(messages|mentions|fork|mission|profile|dispatch)$/);
   if (request.method === "POST" && dialogueMessageMatch) {
     try {
       const payload = await readJsonBody(request);
@@ -1974,6 +1974,8 @@ const server = http.createServer(async (request, response) => {
       if (kind === "messages") sendJson(response, 201, { dialogue: organization.recordDialogueMessage(dialogueId, payload) });
       else if (kind === "mentions") sendJson(response, 201, { dialogue: organization.addMention(dialogueId, payload) });
       else if (kind === "mission") sendJson(response, 200, { dialogue: organization.linkDialogueMission(dialogueId, payload.missionId) });
+      else if (kind === "profile") sendJson(response, 200, { dialogue: organization.setDialogueProfile(dialogueId, payload) });
+      else if (kind === "dispatch") sendJson(response, 202, { dialogue: organization.dispatchSunTask(dialogueId, payload) });
       else sendJson(response, 201, {
         dialogue: organization.openDialogue({
           projectId: payload.projectId,

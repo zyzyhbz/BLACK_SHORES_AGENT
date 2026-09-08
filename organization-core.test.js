@@ -1615,8 +1615,7 @@ test("acceptance requires a passed quality decision", async () => {
   assert.equal(accepted.status, "accepted");
 });
 
-test("dialogues isolate context with fork and mention follow", async () => {
-  const { ledger } = tempLedger();
+test("dialogues isolate context with fork and mention follow", async () => {  const { ledger } = tempLedger();
   const service = new OrganizationService({
     ledger,
     project: project("d"),
@@ -1640,4 +1639,66 @@ test("dialogues isolate context with fork and mention follow", async () => {
   const refreshed = service.refreshMention(other.id, parent.id);
   assert.equal(refreshed.mentions[0].messages.length, 3);
   assert.ok(service.state().dialogues.some((item) => item.id === child.id));
+});
+
+test("sun replies in dialogue and creates missions on order", async () => {
+  const { ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project("d"),
+    runRole: async () => ({
+      output: JSON.stringify({ reply: "收到，正在看。", wantsMission: false }),
+    }),
+  });
+  const dialogue = service.openDialogue({ projectId: "project-example", title: "太阳测试" });
+  service.recordDialogueMessage(dialogue.id, { content: "你好", triggerReply: false });
+  assert.equal(service.activeSuns.size, 0);
+  service.recordDialogueMessage(dialogue.id, { content: "帮我看看" });
+  assert.ok(service.activeSuns.has(dialogue.id));
+  await service.activeSuns.get(dialogue.id).task;
+  const updated = service._dialogueRegistry().find((item) => item.id === dialogue.id);
+  const sunMessage = updated.messages.at(-1);
+  assert.equal(sunMessage.roleName, "太阳");
+  assert.match(sunMessage.content, /收到/);
+  const profiled = service.setDialogueProfile(dialogue.id, { profile: "heavy" });
+  assert.equal(profiled.workflowProfile.resolved, "heavy");
+});
+
+test("sun creates missions with dialogue profile, target and origin", async () => {
+  const { ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project("d"),
+    runRole: async () => ({
+      output: JSON.stringify({ reply: "好，开工。", wantsMission: true, missionGoal: "验证太阳建任务的完整闭环" }),
+    }),
+  });
+  const dialogue = service.openDialogue({ projectId: "project-example", title: "建任务", workflowProfile: "light" });
+  service.recordDialogueMessage(dialogue.id, { content: "建个任务" });
+  await service.activeSuns.get(dialogue.id).task;
+  const missions = service.state().missions;
+  assert.equal(missions.length, 1);
+  assert.equal(missions[0].originDialogueId, dialogue.id);
+  assert.equal(missions[0].targetProjectId, "project-example");
+  assert.equal(missions[0].workflowProfile.requested, "light");
+  const linked = service._dialogueRegistry().find((item) => item.id === dialogue.id);
+  assert.ok(linked.missionIds.includes(missions[0].id));
+});
+
+test("tuner dispatches orders that wake the dialogue sun", async () => {
+  const { directory, ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project(directory),
+    runRole: async () => ({
+      output: JSON.stringify({ reply: "接单。", wantsMission: false }),
+    }),
+  });
+  const dialogue = service.openDialogue({ projectId: "project-example", title: "待派单" });
+  assert.throws(() => service.dispatchSunTask(dialogue.id, { instruction: "x" }), /不能为空/);
+  service.dispatchSunTask(dialogue.id, { instruction: "去把状态查一遍" });
+  await service.activeSuns.get(dialogue.id).task;
+  const updated = service._dialogueRegistry().find((item) => item.id === dialogue.id);
+  assert.ok(updated.messages.some((message) => message.roleName === "群星的调律者"));
+  assert.ok(updated.messages.some((message) => message.roleName === "太阳"));
 });

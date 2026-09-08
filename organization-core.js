@@ -356,6 +356,7 @@ function emptyMission(event) {
     id: event.missionId,
     projectId: event.projectId,
     targetProjectId: event.payload.targetProjectId || event.projectId,
+    originDialogueId: event.payload.originDialogueId || null,
     title: event.payload.title,
     goal: event.payload.goal,
     status: "intake",
@@ -822,8 +823,7 @@ ${missionContext(mission, "independent-reviewer")}
 {"message":"复核结论","verdict":"pass|changes_required|blocked","findings":[{"severity":"P0|P1|P2|P3","title":"问题","evidence":"文件/行或行为证据","requiredChange":"要求"}],"requirementCoverage":[{"criterion":"标准","status":"covered|missing|unclear","evidence":"证据"}],"residualRisks":["风险"]}`;
 }
 
-function buildTestPrompt(mission, manifest = {}) {
-  return `${renderRoleContract("tester")}
+function buildTestPrompt(mission, manifest = {}) {  return `${renderRoleContract("tester")}
 
 你负责实际执行测试，不修改产品实现，不以静态代码阅读冒充测试，不伪造外部环境结果。可以运行 ProjectTestManifest 指定的自动化、类型检查、集成测试、端到端测试和预检工具。
 当前 ProjectTestManifest：
@@ -835,6 +835,23 @@ ${missionContext(mission, "tester")}
 
 只输出一个 JSON 对象：
 {"message":"测试结论","verdict":"pass|fail|blocked","candidate":{"commit":"精确 SHA 或明确候选身份","clean":true},"runs":[{"testId":"Manifest 测试 ID","level":"unit|integration|e2e|preflight","command":"命令或步骤","result":"passed|failed|blocked","evidence":"可定位证据"}],"externalEvidencePackage":{"buildIdentity":"候选身份或待生成","preconditions":["前置"],"steps":[{"id":"E1","action":"人类或外部系统操作","expected":"预期","requiredEvidence":"证据","stopCondition":"停止条件"}],"uncoveredRisks":["未覆盖风险"]}}`;
+}
+
+function buildSunPrompt(dialogue, project) {
+  return `${renderRoleContract("chief-manager")}
+
+你是本对话（${dialogue.title}）的负责人“太阳”。你拥有与群星的调律者相同的组织权限，但你的任务只在本对话内：回复用户、听从用户。你看不到其他对话，只能看到本对话消息、显式引用快照和目标项目的公开事实。
+
+对话上下文：
+${JSON.stringify({ messages: dialogue.messages || [], mentions: dialogue.mentions || [], project: { id: project?.id, name: project?.name } }, null, 2)}
+
+目标项目：${project?.name || project?.id || ""}
+本对话模式：${dialogue.workflowProfile?.requested || "auto"}（你为本对话创建 Mission 时默认使用此档，目标项目固定为本对话项目）
+
+规则：合并、发布、验收、付费类关键动作，必须用户在本对话内明确下令才能执行，执行时如实记录受托来源；需要跨对话或全局动作时，明确说明并转交群星的调律者，不要自行跨界。
+
+只输出一个 JSON 对象：
+{"reply":"给用户的回复","wantsMission":false,"missionGoal":"需要建 Mission 时填写具体目标"}`;
 }
 
 function publicMission(mission) {
@@ -880,6 +897,7 @@ class OrganizationService {
     this.maxRecoveryAttempts = maxRecoveryAttempts;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.activeRuns = new Map();
+    this.activeSuns = new Map();
     this._recoverInterruptedRuns();
   }
 
@@ -1109,11 +1127,16 @@ class OrganizationService {
           dialogue.mentions.push({ at: event.at, ...event.payload.mention });
           dialogue.updatedAt = event.at;
         }
-      } else if (event.type === "dialogue.mention_refreshed") {
-        const dialogue = dialogues.get(event.payload.id);
+      } else if (event.type === "dialogue.mention_refreshed") {        const dialogue = dialogues.get(event.payload.id);
         const mention = dialogue?.mentions.find((item) => item.dialogueId === event.payload.mention.dialogueId);
         if (mention) {
           Object.assign(mention, event.payload.mention, { refreshedAt: event.at });
+          dialogue.updatedAt = event.at;
+        }
+      } else if (event.type === "dialogue.profile_selected") {
+        const dialogue = dialogues.get(event.payload.id);
+        if (dialogue) {
+          dialogue.workflowProfile = { ...event.payload.profile, selectedAt: event.at };
           dialogue.updatedAt = event.at;
         }
       } else if (event.type === "dialogue.mission_linked") {
@@ -1156,9 +1179,10 @@ class OrganizationService {
       };
     }
     const id = makeId("dlg");
+    const profile = resolveWorkflowProfile(input.workflowProfile || "auto", "");
     this.ledger.append("dialogue.opened", {
       actorRoleId: "human-owner",
-      payload: { id, projectId, title, parentId: parentId || null, forkSnapshot },
+      payload: { id, projectId, title, parentId: parentId || null, workflowProfile: profile, forkSnapshot },
     });
     if (forkSnapshot) {
       for (const message of forkSnapshot.messages) {
@@ -1181,6 +1205,18 @@ class OrganizationService {
     return this._dialogueRegistry().find((item) => item.id === id);
   }
 
+  setDialogueProfile(dialogueId, input) {
+    assertObject(input, "对话模式");
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
+    const profile = resolveWorkflowProfile(input.profile || "auto", dialogue.title || "");
+    this.ledger.append("dialogue.profile_selected", {
+      actorRoleId: "human-owner",
+      payload: { id: dialogueId, profile },
+    });
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
+  }
+
   recordDialogueMessage(dialogueId, input) {
     assertObject(input, "对话消息");
     const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
@@ -1190,9 +1226,21 @@ class OrganizationService {
     const authorType = input.authorType === "role" ? "role" : "human";
     const messageId = makeId("dmsg");
     this.ledger.append("dialogue.message_recorded", {
-      actorRoleId: "human-owner",
-      payload: { id: dialogueId, messageId, message: { authorType, roleId: normalizeText(input.roleId, 80), content } },
+      actorRoleId: input.authorType === "role" ? normalizeText(input.roleId, 80) || "chief-manager" : "human-owner",
+      payload: {
+        id: dialogueId,
+        messageId,
+        message: {
+          authorType,
+          roleId: authorType === "role" ? normalizeText(input.roleId, 80) || "chief-manager" : "human-owner",
+          roleName: authorType === "role" ? normalizeText(input.roleName, 80) || "太阳" : "人类负责人",
+          content,
+        },
+      },
     });
+    if (authorType === "human" && input.triggerReply !== false) {
+      this._queueSunReply(dialogueId);
+    }
     return this._dialogueRegistry().find((item) => item.id === dialogueId);
   }
 
@@ -1249,8 +1297,30 @@ class OrganizationService {
     return this._dialogueRegistry().find((item) => item.id === dialogueId);
   }
 
-  linkDialogueMission(dialogueId, missionId) {
+  dispatchSunTask(dialogueId, input) {
+    assertObject(input, "调度指令");
     const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
+    const instruction = normalizeText(input.instruction, 8000);
+    if (instruction.length < 4) throw Object.assign(new Error("调度指令不能为空"), { statusCode: 400 });
+    this.ledger.append("dialogue.message_recorded", {
+      actorRoleId: "chief-manager",
+      payload: {
+        id: dialogueId,
+        messageId: makeId("dmsg"),
+        message: {
+          authorType: "role",
+          roleId: "chief-manager",
+          roleName: "群星的调律者",
+          content: `【调律者调度】${instruction}`,
+        },
+      },
+    });
+    this._queueSunReply(dialogueId);
+    return this._dialogueRegistry().find((item) => item.id === dialogueId);
+  }
+
+  linkDialogueMission(dialogueId, missionId) {    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
     if (!dialogue) throw Object.assign(new Error("对话不存在"), { statusCode: 404 });
     const mission = this.mission(missionId);
     if (!mission) throw Object.assign(new Error("Mission 不存在"), { statusCode: 404 });
@@ -1469,8 +1539,97 @@ class OrganizationService {
     }
   }
 
-  createMission(goal, workflowProfile = "auto", targetProjectId = null) {
-    const normalizedGoal = normalizeText(goal, 4000);
+  _queueSunReply(dialogueId) {
+    if (this.activeSuns.has(dialogueId)) return;
+    const dialogue = this._dialogueRegistry().find((item) => item.id === dialogueId);
+    if (!dialogue) return;
+    const project = this._projectFor({ targetProjectId: dialogue.projectId, projectId: dialogue.projectId });
+    const assignment = this._assignmentForRole("chief-manager");
+    if (!assignment.ready) {
+      this.ledger.append("dialogue.message_recorded", {
+        actorRoleId: "chief-manager",
+        payload: {
+          id: dialogueId,
+          messageId: makeId("dmsg"),
+          message: { authorType: "role", roleId: "chief-manager", roleName: "太阳", content: "太阳暂时无法回复：没有可用的任职。" },
+        },
+      });
+      return;
+    }
+    const sunId = makeId("sun");
+    const invocationId = makeId("invocation");
+    const active = { sunId, invocationId, startedAt: nowIso(), task: null };
+    this.activeSuns.set(dialogueId, active);
+    const prompt = buildSunPrompt(dialogue, project);
+    const task = Promise.resolve()
+      .then(() => this.runRole({
+        role: ROLE_BY_ID.get("chief-manager"),
+        missionId: null,
+        goal: `回复对话：${dialogue.title}`,
+        scope: [],
+        adapterId: assignment.adapterId,
+        prompt,
+        cwd: project.workingDirectory || this.project.workingDirectory,
+        model: assignment.model,
+        reasoningEffort: assignment.reasoningEffort,
+        runId: sunId,
+        invocationId,
+        onActivity: () => {},
+        signal: active.abortController?.signal,
+      }))
+      .then((result) => {
+        const parsed = extractJsonObject(result.output);
+        const reply = normalizeText(parsed.reply, 8000) || "收到，我在跟进。";
+        this.ledger.append("dialogue.message_recorded", {
+          actorRoleId: "chief-manager",
+          causationId: sunId,
+          payload: {
+            id: dialogueId,
+            messageId: makeId("dmsg"),
+            message: { authorType: "role", roleId: "chief-manager", roleName: "太阳", content: reply },
+          },
+        });
+        if (parsed.wantsMission === true && normalizeText(parsed.missionGoal, 4000).length >= 8) {
+          try {
+            const mission = this.createMission(
+              parsed.missionGoal,
+              dialogue.workflowProfile?.requested || "auto",
+              dialogue.projectId,
+              dialogueId,
+            );
+            this.linkDialogueMission(dialogueId, mission.id);
+          } catch (error) {
+            this.ledger.append("dialogue.message_recorded", {
+              actorRoleId: "chief-manager",
+              causationId: sunId,
+              payload: {
+                id: dialogueId,
+                messageId: makeId("dmsg"),
+                message: { authorType: "role", roleId: "chief-manager", roleName: "太阳", content: `建 Mission 失败：${normalizeText(error.message, 500)}` },
+              },
+            });
+          }
+        }
+        result.completeAction?.({ status: "completed", summary: reply.slice(0, 500) });
+      })
+      .catch((error) => {
+        this.ledger.append("dialogue.message_recorded", {
+          actorRoleId: "chief-manager",
+          causationId: sunId,
+          payload: {
+            id: dialogueId,
+            messageId: makeId("dmsg"),
+            message: { authorType: "role", roleId: "chief-manager", roleName: "太阳", content: `太阳暂时无法回复：${normalizeText(error.message, 500)}` },
+          },
+        });
+      })
+      .finally(() => {
+        if (this.activeSuns.get(dialogueId) === active) this.activeSuns.delete(dialogueId);
+      });
+    active.task = task;
+  }
+
+  createMission(goal, workflowProfile = "auto", targetProjectId = null, originDialogueId = null) {    const normalizedGoal = normalizeText(goal, 4000);
     if (normalizedGoal.length < 8) throw Object.assign(new Error("请描述一个明确的结果目标"), { statusCode: 400 });
     if (!this.managerAssignment.ready) {
       throw Object.assign(
@@ -1493,7 +1652,7 @@ class OrganizationService {
     this.ledger.append("mission.created", {
       missionId,
       actorRoleId: "chief-manager",
-      payload: { title: normalizedGoal.slice(0, 42), goal: normalizedGoal, workflowProfile: profile.requested, targetProjectId: target || null },
+      payload: { title: normalizedGoal.slice(0, 42), goal: normalizedGoal, workflowProfile: profile.requested, targetProjectId: target || null, originDialogueId: normalizeText(originDialogueId, 200) || null },
     });
     this.ledger.append("workflow_profile.selected", {
       missionId,
