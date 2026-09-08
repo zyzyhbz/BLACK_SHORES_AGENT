@@ -1948,6 +1948,56 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/dialogues") {
+    const projectId = url.searchParams.get("projectId");
+    const dialogues = organization.state().dialogues;
+    sendJson(response, 200, { dialogues: projectId ? dialogues.filter((item) => item.projectId === projectId) : dialogues });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/dialogues") {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 201, { dialogue: organization.openDialogue(payload) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const dialogueMessageMatch = url.pathname.match(/^\/api\/dialogues\/([^/]+)\/(messages|mentions|fork|mission)$/);
+  if (request.method === "POST" && dialogueMessageMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      const dialogueId = decodeURIComponent(dialogueMessageMatch[1]);
+      const kind = dialogueMessageMatch[2];
+      if (kind === "messages") sendJson(response, 201, { dialogue: organization.recordDialogueMessage(dialogueId, payload) });
+      else if (kind === "mentions") sendJson(response, 201, { dialogue: organization.addMention(dialogueId, payload) });
+      else if (kind === "mission") sendJson(response, 200, { dialogue: organization.linkDialogueMission(dialogueId, payload.missionId) });
+      else sendJson(response, 201, {
+        dialogue: organization.openDialogue({
+          projectId: payload.projectId,
+          title: payload.title,
+          parentId: dialogueId,
+        }),
+      });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
+  const mentionRefreshMatch = url.pathname.match(/^\/api\/dialogues\/([^/]+)\/mentions\/refresh$/);
+  if (request.method === "POST" && mentionRefreshMatch) {
+    try {
+      const payload = await readJsonBody(request);
+      sendJson(response, 200, { dialogue: organization.refreshMention(decodeURIComponent(mentionRefreshMatch[1]), payload.sourceId) });
+    } catch (error) {
+      organizationError(response, error);
+    }
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/issues") {
     sendJson(response, 200, { issues: organization.state().issues });
     return;
@@ -2133,7 +2183,8 @@ const server = http.createServer(async (request, response) => {
       } else if (action === "confirm-baseline") {
         sendJson(response, 202, { mission: organization.confirmBaseline(missionId) });
       } else if (action === "retry") {
-        sendJson(response, 202, { mission: organization.retry(missionId) });
+        const payload = await readJsonBody(request).catch(() => ({}));
+        sendJson(response, 202, { mission: organization.retry(missionId, payload) });
       } else if (action === "start-heavy-review") {
         sendJson(response, 202, { mission: organization.startHeavyReview(missionId) });
       } else if (action === "verify-source") {

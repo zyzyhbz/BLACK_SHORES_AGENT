@@ -1390,8 +1390,7 @@ test("clarification beyond 20 minutes escalates to a human decision", async () =
   assert.equal(service.mission(fresh.id).decisions.filter((item) => item.kind === "requirements_stalemate").length, 0);
 });
 
-test("issues track the seven-state workflow with terminal guards", async () => {
-  const { ledger } = tempLedger();
+test("issues track the seven-state workflow with terminal guards", async () => {  const { ledger } = tempLedger();
   const service = new OrganizationService({
     ledger,
     project: project("d"),
@@ -1614,4 +1613,31 @@ test("acceptance requires a passed quality decision", async () => {
   service.decideQuality("mission-quality-gate", { verdict: "passed", basis: "复核与测试证据齐全", decidedBy: "human-owner" });
   const accepted = service.acceptResult("mission-quality-gate");
   assert.equal(accepted.status, "accepted");
+});
+
+test("dialogues isolate context with fork and mention follow", async () => {
+  const { ledger } = tempLedger();
+  const service = new OrganizationService({
+    ledger,
+    project: project("d"),
+    runRole: async () => { throw new Error("unused"); },
+  });
+  const parent = service.openDialogue({ projectId: "project-example", title: "父对话" });
+  assert.equal(parent.messages.length, 0);
+  assert.throws(() => service.openDialogue({ projectId: "project-nope", title: "坏项目" }), /未知目标项目/);
+  service.recordDialogueMessage(parent.id, { content: "第一条" });
+  service.recordDialogueMessage(parent.id, { content: "第二条" });
+  const child = service.openDialogue({ title: "分叉", parentId: parent.id });
+  assert.equal(child.messages.length, 2);
+  assert.ok(child.messages.every((message) => message.forkedFrom === parent.id));
+  const other = service.openDialogue({ title: "第三方" });
+  assert.throws(() => service.addMention(other.id, { sourceId: other.id }), /自身/);
+  const mentioned = service.addMention(other.id, { sourceId: parent.id });
+  assert.equal(mentioned.mentions.length, 1);
+  assert.equal(mentioned.mentions[0].messages.length, 2);
+  assert.throws(() => service.addMention(parent.id, { sourceId: other.id }), /循环/);
+  service.recordDialogueMessage(parent.id, { content: "第三条" });
+  const refreshed = service.refreshMention(other.id, parent.id);
+  assert.equal(refreshed.mentions[0].messages.length, 3);
+  assert.ok(service.state().dialogues.some((item) => item.id === child.id));
 });
